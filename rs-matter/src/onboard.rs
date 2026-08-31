@@ -63,7 +63,9 @@ use core::num::NonZeroU8;
 use crate::cert::gen::Validity;
 use crate::crypto::{Crypto, RngCore, AEAD_CANON_KEY_LEN};
 use crate::dm::clusters::gen_comm::{CommissioningErrorEnum, GeneralCommissioningClient};
-use crate::dm::clusters::noc::{NodeOperationalCertStatusEnum, OperationalCredentialsClient};
+use crate::dm::clusters::noc::{
+    CertificateChainTypeEnum, NodeOperationalCertStatusEnum, OperationalCredentialsClient,
+};
 use crate::dm::endpoints::ROOT_ENDPOINT_ID;
 use crate::dm::NodeId;
 use crate::error::{Error, ErrorCode};
@@ -71,6 +73,7 @@ use crate::onboard::noc::NocGenerator;
 use crate::tlv::{FromTLV, OctetStr, TLVElement};
 use crate::transport::exchange::Exchange;
 use crate::transport::network::Address;
+use crate::transport::session::ATT_CHALLENGE_LEN;
 use crate::transport::TransportPreference;
 use crate::Matter;
 
@@ -96,13 +99,11 @@ pub struct CommissionOptions {
     /// flow must complete before this expires, otherwise the device
     /// rolls back any partial state.
     pub fail_safe_secs: u16,
-    /// Skip Device Attestation verification.
+    /// Allow [`Commissioner::commission`] to accept attestation evidence
+    /// without verification. Suitable only for test devices.
     ///
-    /// Real DCL fetch + cert-chain validation is deferred to a follow-up.
-    /// Until then the only supported mode is `true` (accept the device's
-    /// attestation unconditionally) — suitable only for test devices like
-    /// `chip-all-clusters-app`. Setting `false` causes commissioning to
-    /// fail with [`ErrorCode::Failure`] (no verification path exists yet).
+    /// Production callers should leave this `false` and use
+    /// [`Commissioner::commission_with_attestation`] instead.
     pub allow_test_attestation: bool,
 }
 
@@ -119,6 +120,25 @@ impl Default for CommissionOptions {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Device attestation material borrowed directly from commissioning responses.
+///
+/// Each value is valid only for the duration of the verifier callback. Values
+/// arrive in variant order; staging lets the commissioner remain zero-copy
+/// despite the transport's single receive buffer.
+pub enum AttestationEvidence<'a> {
+    /// Device Attestation Certificate bytes.
+    Dac(&'a [u8]),
+    /// Product Attestation Intermediate certificate bytes.
+    Pai(&'a [u8]),
+    /// Attestation response bytes and the inputs needed to verify its signature.
+    Attestation {
+        elements: &'a [u8],
+        signature: &'a [u8],
+        nonce: &'a [u8; 32],
+        challenge: &'a [u8; ATT_CHALLENGE_LEN],
+    },
 }
 
 /// What [`Commissioner::commission`] returns on success.
@@ -274,13 +294,45 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
         device_node_id: NodeId,
         validity: Validity,
     ) -> Result<CommissionResult, Error> {
-        // The first PASE step (ArmFailSafe) establishes the PASE session via
-        // `initiate_pase`; the rest reuse it.
+        if !opts.allow_test_attestation {
+            return Err(ErrorCode::Failure.into());
+        }
+
+        self.commission_with_attestation(
+            peer_addr,
+            passcode,
+            opts,
+            device_node_id,
+            validity,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    /// Phase 1 commissioning with caller-supplied device attestation verification.
+    ///
+    /// `verify` is called for DAC, PAI, then the attestation response, while each
+    /// response buffer is live and before it is completed. Any callback error is
+    /// returned before CSRRequest, AddTrustedRootCertificate, or AddNOC is sent.
+    pub async fn commission_with_attestation<F>(
+        &mut self,
+        peer_addr: Address,
+        passcode: u32,
+        opts: &CommissionOptions,
+        device_node_id: NodeId,
+        validity: Validity,
+        verify: F,
+    ) -> Result<CommissionResult, Error>
+    where
+        F: for<'e> FnMut(AttestationEvidence<'e>) -> Result<(), Error>,
+    {
         self.arm_fail_safe(peer_addr, passcode, opts.fail_safe_secs)
             .await?;
 
-        // Device Attestation — structural hook. See [`CommissionOptions::allow_test_attestation`].
-        self.verify_device_attestation(opts).await?;
+        let mut attestation_nonce = [0u8; 32];
+        self.crypto.rand()?.fill_bytes(&mut attestation_nonce);
+        self.verify_device_attestation(peer_addr, passcode, &attestation_nonce, verify)
+            .await?;
 
         // CSRRequest: random 32B nonce, then validate the device's echo
         // and mint the operational NOC in the same scope where the CSR
@@ -604,16 +656,77 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
         Ok(())
     }
 
-    /// DAC verification placeholder.
-    ///
-    /// Returns `Ok(())` iff `allow_test_attestation` is set; real
-    /// verification (RequestAttestation → DCL chain validation) lands
-    /// in a follow-up.
-    async fn verify_device_attestation(&self, opts: &CommissionOptions) -> Result<(), Error> {
-        if opts.allow_test_attestation {
-            return Ok(());
-        }
+    async fn verify_device_attestation<F>(
+        &self,
+        peer_addr: Address,
+        passcode: u32,
+        nonce: &[u8; 32],
+        mut verify: F,
+    ) -> Result<(), Error>
+    where
+        F: for<'e> FnMut(AttestationEvidence<'e>) -> Result<(), Error>,
+    {
+        let dac_exchange =
+            Exchange::initiate_pase(self.matter, &self.crypto, peer_addr, passcode).await?;
+        let mut challenge = [0; ATT_CHALLENGE_LEN];
+        dac_exchange.with_state(|state| {
+            let session = dac_exchange.id().session(&mut state.sessions);
+            challenge.copy_from_slice(
+                session
+                    .get_att_challenge()
+                    .ok_or(ErrorCode::InvalidState)?
+                    .access(),
+            );
+            Ok(())
+        })?;
+        let dac_handle = dac_exchange
+            .operational_credentials()
+            .certificate_chain_request(ROOT_ENDPOINT_ID, |req| {
+                req.certificate_type(CertificateChainTypeEnum::DACCertificate)?
+                    .end()
+            })
+            .await?;
+        let verification = {
+            let response = dac_handle.response()?;
+            verify(AttestationEvidence::Dac(response.certificate()?.0))
+        };
+        dac_handle.complete().await?;
+        verification?;
 
-        Err(ErrorCode::Failure.into())
+        let pai_handle = Exchange::initiate_pase(self.matter, &self.crypto, peer_addr, passcode)
+            .await?
+            .operational_credentials()
+            .certificate_chain_request(ROOT_ENDPOINT_ID, |req| {
+                req.certificate_type(CertificateChainTypeEnum::PAICertificate)?
+                    .end()
+            })
+            .await?;
+        let verification = {
+            let response = pai_handle.response()?;
+            verify(AttestationEvidence::Pai(response.certificate()?.0))
+        };
+        pai_handle.complete().await?;
+        verification?;
+
+        let attestation_handle =
+            Exchange::initiate_pase(self.matter, &self.crypto, peer_addr, passcode)
+                .await?
+                .operational_credentials()
+                .attestation_request(ROOT_ENDPOINT_ID, |req| {
+                    req.attestation_nonce(OctetStr::new(nonce))?.end()
+                })
+                .await?;
+        let verification = {
+            let response = attestation_handle.response()?;
+            verify(AttestationEvidence::Attestation {
+                elements: response.attestation_elements()?.0,
+                signature: response.attestation_signature()?.0,
+                nonce,
+                challenge: &challenge,
+            })
+        };
+        attestation_handle.complete().await?;
+
+        verification
     }
 }
