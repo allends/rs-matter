@@ -230,14 +230,10 @@ const CD_SIGNING_KEY_005_PUBKEY: [u8; P256_PUBLIC_KEY_LEN] = [
 ];
 
 // ---------------------------------------------------------------------------
-// Trust store: all 6 well-known keys
+// Production trust store: 5 official keys
 // ---------------------------------------------------------------------------
 
-const WELL_KNOWN_CD_SIGNING_KEYS: [CdSigningKey; 6] = [
-    CdSigningKey {
-        kid: TEST_CD_KID,
-        pubkey: TEST_CD_PUBKEY,
-    },
+const WELL_KNOWN_CD_SIGNING_KEYS: [CdSigningKey; 5] = [
     CdSigningKey {
         kid: CD_SIGNING_KEY_001_KID,
         pubkey: CD_SIGNING_KEY_001_PUBKEY,
@@ -262,7 +258,7 @@ const WELL_KNOWN_CD_SIGNING_KEYS: [CdSigningKey; 6] = [
 
 /// Look up a CD signing key by Subject Key Identifier.
 ///
-/// Searches the 6 well-known CSA CD signing keys (1 test + 5 official).
+/// Searches only the 5 official CSA CD signing keys.
 /// Returns the P-256 uncompressed public key bytes if a matching KID is found.
 pub fn lookup_cd_signing_key(kid: &[u8]) -> Option<&'static [u8; P256_PUBLIC_KEY_LEN]> {
     if kid.len() != KEY_IDENTIFIER_LEN {
@@ -276,6 +272,15 @@ pub fn lookup_cd_signing_key(kid: &[u8]) -> Option<&'static [u8; P256_PUBLIC_KEY
     }
 
     None
+}
+
+/// Look up the non-production test CD signing key.
+pub(crate) fn lookup_test_cd_signing_key(kid: &[u8]) -> Option<&'static [u8; P256_PUBLIC_KEY_LEN]> {
+    if is_test_cd_key(kid) {
+        Some(&TEST_CD_PUBKEY)
+    } else {
+        None
+    }
 }
 
 /// Check if a Key ID corresponds to the test CD signing key.
@@ -293,7 +298,8 @@ mod tests {
 
     #[test]
     fn test_lookup_test_key() {
-        let pubkey = lookup_cd_signing_key(&TEST_CD_KID);
+        assert!(lookup_cd_signing_key(&TEST_CD_KID).is_none());
+        let pubkey = lookup_test_cd_signing_key(&TEST_CD_KID);
         assert!(pubkey.is_some());
         // Verify it starts with 0x04 (uncompressed point prefix)
         assert_eq!(pubkey.unwrap()[0], 0x04);

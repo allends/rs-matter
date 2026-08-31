@@ -36,7 +36,7 @@ use crate::cert::der_utils::ecdsa_der_to_raw;
 use crate::cert::x509::AlgorithmIdentifier;
 use crate::crypto::{CanonPkcPublicKeyRef, CanonPkcSignatureRef, Crypto, PublicKey};
 use crate::error::{Error, ErrorCode};
-use crate::tlv::{TLVElement, TLVSequence};
+use crate::tlv::{TLVElement, TLVSequence, TLVTag};
 
 use der::asn1::{AnyRef, ObjectIdentifier, OctetStringRef};
 use der::{
@@ -161,9 +161,14 @@ impl<'a> DecodeValue<'a> for SignedData<'a> {
                 return Err(der::ErrorKind::Failed.into());
             }
 
-            // skip digestAlgorithms SET OF
-            let _digest_algorithms = AnyRef::decode(reader)?;
-            if _digest_algorithms.tag() != Tag::Set {
+            // digestAlgorithms must contain exactly one SHA-256 AlgorithmIdentifier.
+            let digest_algorithms = AnyRef::decode(reader)?;
+            if digest_algorithms.tag() != Tag::Set {
+                return Err(der::ErrorKind::Failed.into());
+            }
+
+            let digest_algorithm = AlgorithmIdentifier::from_der(digest_algorithms.value())?;
+            if digest_algorithm.algorithm != OID_SHA256 {
                 return Err(der::ErrorKind::Failed.into());
             }
 
@@ -474,9 +479,18 @@ impl CertificationElements {
     pub fn decode(cd_content: &[u8]) -> Result<Self, Error> {
         let elem = TLVElement::new(cd_content);
         let structure = elem.structure()?;
+        if elem.tag()? != TLVTag::Anonymous || elem.raw_value()?.len() + 1 != cd_content.len() {
+            return Err(ErrorCode::CdInvalidFormat.into());
+        }
+        Self::validate_tag_order(&structure)?;
 
         let format_version = structure.find_ctx(CD_TAG_FORMAT_VERSION)?.u16()?;
         if format_version != 1 {
+            return Err(ErrorCode::CdInvalidFormat.into());
+        }
+
+        let device_type_id = structure.find_ctx(CD_TAG_DEVICE_TYPE_ID)?.u32()?;
+        if device_type_id > 0x7fff_ffff {
             return Err(ErrorCode::CdInvalidFormat.into());
         }
 
@@ -492,7 +506,7 @@ impl CertificationElements {
             vendor_id: structure.find_ctx(CD_TAG_VENDOR_ID)?.u16()?,
             product_ids,
             product_ids_count,
-            device_type_id: structure.find_ctx(CD_TAG_DEVICE_TYPE_ID)?.u32()?,
+            device_type_id,
             certificate_id,
             security_level: structure.find_ctx(CD_TAG_SECURITY_LEVEL)?.u8()?,
             security_information: structure.find_ctx(CD_TAG_SECURITY_INFORMATION)?.u16()?,
@@ -506,6 +520,60 @@ impl CertificationElements {
             authorized_paa_list,
             authorized_paa_list_count,
         })
+    }
+
+    /// Validate the profiled CD field order before doing random-access decoding.
+    fn validate_tag_order(structure: &TLVSequence) -> Result<(), Error> {
+        let mut next_mandatory_tag = CD_TAG_FORMAT_VERSION;
+        let mut optional_state = CD_TAG_DAC_ORIGIN_VENDOR_ID;
+
+        for element in structure.iter() {
+            let element = element?;
+            let TLVTag::Context(tag) = element.tag()? else {
+                return Err(ErrorCode::CdInvalidFormat.into());
+            };
+
+            if next_mandatory_tag <= CD_TAG_CERTIFICATION_TYPE {
+                if tag != next_mandatory_tag {
+                    return Err(ErrorCode::CdInvalidFormat.into());
+                }
+                next_mandatory_tag += 1;
+                continue;
+            }
+
+            match optional_state {
+                CD_TAG_DAC_ORIGIN_VENDOR_ID => match tag {
+                    CD_TAG_DAC_ORIGIN_VENDOR_ID => {
+                        optional_state = CD_TAG_DAC_ORIGIN_PRODUCT_ID;
+                    }
+                    CD_TAG_AUTHORIZED_PAA_LIST => {
+                        optional_state = CD_TAG_AUTHORIZED_PAA_LIST + 1;
+                    }
+                    _ => return Err(ErrorCode::CdInvalidFormat.into()),
+                },
+                CD_TAG_DAC_ORIGIN_PRODUCT_ID => {
+                    if tag != CD_TAG_DAC_ORIGIN_PRODUCT_ID {
+                        return Err(ErrorCode::CdInvalidFormat.into());
+                    }
+                    optional_state = CD_TAG_AUTHORIZED_PAA_LIST;
+                }
+                CD_TAG_AUTHORIZED_PAA_LIST => {
+                    if tag != CD_TAG_AUTHORIZED_PAA_LIST {
+                        return Err(ErrorCode::CdInvalidFormat.into());
+                    }
+                    optional_state = CD_TAG_AUTHORIZED_PAA_LIST + 1;
+                }
+                _ => return Err(ErrorCode::CdInvalidFormat.into()),
+            }
+        }
+
+        if next_mandatory_tag <= CD_TAG_CERTIFICATION_TYPE
+            || optional_state == CD_TAG_DAC_ORIGIN_PRODUCT_ID
+        {
+            return Err(ErrorCode::CdInvalidFormat.into());
+        }
+
+        Ok(())
     }
 
     /// Parse the product ID array from TLV structure.
@@ -576,20 +644,26 @@ impl CertificationElements {
         let mut authorized_paa_list = [[0u8; KEY_IDENTIFIER_LEN]; MAX_AUTHORIZED_PAA_LIST];
         let mut paa_count = 0usize;
 
-        if !paa_elem.is_empty() {
-            let paa_seq = paa_elem.array()?;
-            for paa_entry in paa_seq.iter() {
-                let paa_entry: TLVElement<'_> = paa_entry?;
-                if paa_count >= MAX_AUTHORIZED_PAA_LIST {
-                    return Err(ErrorCode::CdInvalidFormat.into());
-                }
-                let paa_bytes = paa_entry.str()?;
-                if paa_bytes.len() != KEY_IDENTIFIER_LEN {
-                    return Err(ErrorCode::CdInvalidFormat.into());
-                }
-                authorized_paa_list[paa_count].copy_from_slice(paa_bytes);
-                paa_count += 1;
+        if paa_elem.is_empty() {
+            return Ok((authorized_paa_list, paa_count));
+        }
+
+        let paa_seq = paa_elem.array()?;
+        for paa_entry in paa_seq.iter() {
+            let paa_entry: TLVElement<'_> = paa_entry?;
+            if paa_count >= MAX_AUTHORIZED_PAA_LIST {
+                return Err(ErrorCode::CdInvalidFormat.into());
             }
+            let paa_bytes = paa_entry.str()?;
+            if paa_bytes.len() != KEY_IDENTIFIER_LEN {
+                return Err(ErrorCode::CdInvalidFormat.into());
+            }
+            authorized_paa_list[paa_count].copy_from_slice(paa_bytes);
+            paa_count += 1;
+        }
+
+        if paa_count == 0 {
+            return Err(ErrorCode::CdInvalidFormat.into());
         }
 
         Ok((authorized_paa_list, paa_count))
@@ -618,15 +692,14 @@ impl CertificationElements {
         // Parse CMS envelope
         let cms = CmsSignedData::parse(cms_message)?;
 
-        // Look up signing key
-        let pubkey_bytes = cd_keys::lookup_cd_signing_key(cms.signer_key_id)
-            .ok_or(Error::new(ErrorCode::CdSigningKeyNotFound))?;
-
-        // Test key policy
+        // Production lookup excludes the test key; opt in to its separate path explicitly.
         let is_test_key = cd_keys::is_test_cd_key(cms.signer_key_id);
-        if is_test_key && !allow_test_cd_signing_key {
-            return Err(ErrorCode::CdSigningKeyNotFound.into());
+        let pubkey_bytes = if is_test_key && allow_test_cd_signing_key {
+            cd_keys::lookup_test_cd_signing_key(cms.signer_key_id)
+        } else {
+            cd_keys::lookup_cd_signing_key(cms.signer_key_id)
         }
+        .ok_or(Error::new(ErrorCode::CdSigningKeyNotFound))?;
 
         // Verify ECDSA-SHA256 signature over the raw CD content
         let pubkey_ref = CanonPkcPublicKeyRef::try_new(pubkey_bytes)?;
@@ -771,6 +844,7 @@ fn product_id_in_list(pid: u16, cd: &CertificationElements) -> bool {
 mod tests {
     use super::*;
     use crate::crypto::test_only_crypto;
+    use std::vec::Vec;
 
     // ---- Test vector 1: single product ID, no DAC origin ----
     // Signed with the "Matter Test CD Signing Authority" key.
@@ -885,6 +959,63 @@ mod tests {
         0xfd, 0xaf, 0x07, 0x9a, 0x2c, 0x23, 0xe0, 0xde,
     ];
 
+    const SHA256_ALGORITHM_IDENTIFIER: &[u8] = &[
+        0x30, 0x0b, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+    ];
+
+    fn cms_with_digest_algorithms(algorithm_identifiers: &[u8]) -> Vec<u8> {
+        const DIGEST_SET_START: usize = 23;
+        const DIGEST_SET_END: usize = 38;
+        const DER_LENGTH_OFFSETS: [usize; 3] = [2, 16, 19];
+
+        let mut cms = TEST_CMS_SIGNED_MESSAGE_01.to_vec();
+        assert_eq!(
+            &cms[DIGEST_SET_START + 2..DIGEST_SET_END],
+            SHA256_ALGORITHM_IDENTIFIER
+        );
+
+        let mut digest_set = Vec::with_capacity(algorithm_identifiers.len() + 2);
+        digest_set.push(0x31);
+        digest_set.push(algorithm_identifiers.len() as u8);
+        digest_set.extend_from_slice(algorithm_identifiers);
+
+        let length_delta =
+            algorithm_identifiers.len() as isize - SHA256_ALGORITHM_IDENTIFIER.len() as isize;
+        cms.splice(DIGEST_SET_START..DIGEST_SET_END, digest_set);
+        for offset in DER_LENGTH_OFFSETS {
+            cms[offset] = (cms[offset] as isize + length_delta) as u8;
+        }
+
+        cms
+    }
+
+    fn insert_before_structure_end(content: &[u8], extra: &[u8]) -> Vec<u8> {
+        assert_eq!(content.last(), Some(&0x18));
+        let mut modified = content.to_vec();
+        modified.splice(content.len() - 1..content.len() - 1, extra.iter().copied());
+        modified
+    }
+
+    fn with_device_type_id(content: &[u8], device_type_id: u32) -> Vec<u8> {
+        let offset = unwrap!(content
+            .windows(4)
+            .position(|window| window == [0x25, CD_TAG_DEVICE_TYPE_ID, 0x34, 0x12]));
+        let mut modified = content.to_vec();
+        let bytes = device_type_id.to_le_bytes();
+        modified.splice(
+            offset..offset + 4,
+            [
+                0x26,
+                CD_TAG_DEVICE_TYPE_ID,
+                bytes[0],
+                bytes[1],
+                bytes[2],
+                bytes[3],
+            ],
+        );
+        modified
+    }
+
     // ---- CMS parsing tests ----
 
     #[test]
@@ -922,6 +1053,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_cms_requires_exactly_one_sha256_digest_algorithm() {
+        assert!(CmsSignedData::parse(&cms_with_digest_algorithms(&[])).is_err());
+
+        let mut duplicate = SHA256_ALGORITHM_IDENTIFIER.to_vec();
+        duplicate.extend_from_slice(SHA256_ALGORITHM_IDENTIFIER);
+        assert!(CmsSignedData::parse(&cms_with_digest_algorithms(&duplicate)).is_err());
+
+        let mut sha384 = SHA256_ALGORITHM_IDENTIFIER.to_vec();
+        *unwrap!(sha384.last_mut()) = 0x02;
+        assert!(CmsSignedData::parse(&cms_with_digest_algorithms(&sha384)).is_err());
+    }
+
+    #[test]
     fn test_parse_cms_invalid_data() {
         // Empty
         assert!(CmsSignedData::parse(&[]).is_err());
@@ -945,6 +1089,68 @@ mod tests {
     fn test_decode_cd_content_02() {
         let cd = unwrap!(CertificationElements::decode(TEST_CMS_CD_CONTENT_02));
         assert_eq!(cd, expected_cd_02());
+    }
+
+    #[test]
+    fn test_decode_rejects_non_sequential_duplicate_unknown_and_trailing_tags() {
+        let mut missing_mandatory = TEST_CMS_CD_CONTENT_01.to_vec();
+        missing_mandatory.drain(1..4);
+
+        let mut out_of_order = Vec::with_capacity(TEST_CMS_CD_CONTENT_01.len());
+        out_of_order.push(0x15);
+        out_of_order.extend_from_slice(&TEST_CMS_CD_CONTENT_01[4..8]);
+        out_of_order.extend_from_slice(&TEST_CMS_CD_CONTENT_01[1..4]);
+        out_of_order.extend_from_slice(&TEST_CMS_CD_CONTENT_01[8..]);
+
+        let duplicate = insert_before_structure_end(
+            TEST_CMS_CD_CONTENT_01,
+            &[0x24, CD_TAG_CERTIFICATION_TYPE, 0x00],
+        );
+        let unknown = insert_before_structure_end(TEST_CMS_CD_CONTENT_01, &[0x24, 0x0c, 0x00]);
+        let mut trailing = TEST_CMS_CD_CONTENT_01.to_vec();
+        trailing.extend_from_slice(&[0x24, 0x0c, 0x00]);
+
+        for invalid in [
+            missing_mandatory,
+            out_of_order,
+            duplicate,
+            unknown,
+            trailing,
+        ] {
+            assert_eq!(
+                CertificationElements::decode(&invalid).map_err(|error| error.code()),
+                Err(ErrorCode::CdInvalidFormat)
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_rejects_present_empty_authorized_paa_list() {
+        let empty_paa_list = insert_before_structure_end(
+            TEST_CMS_CD_CONTENT_01,
+            &[0x36, CD_TAG_AUTHORIZED_PAA_LIST, 0x18],
+        );
+        assert_eq!(
+            CertificationElements::decode(&empty_paa_list).map_err(|error| error.code()),
+            Err(ErrorCode::CdInvalidFormat)
+        );
+
+        assert!(CertificationElements::decode(TEST_CMS_CD_CONTENT_01).is_ok());
+    }
+
+    #[test]
+    fn test_decode_restricts_device_type_id_to_signed_31_bit_range() {
+        let maximum = with_device_type_id(TEST_CMS_CD_CONTENT_01, 0x7fff_ffff);
+        assert_eq!(
+            unwrap!(CertificationElements::decode(&maximum)).device_type_id,
+            0x7fff_ffff
+        );
+
+        let too_large = with_device_type_id(TEST_CMS_CD_CONTENT_01, 0x8000_0000);
+        assert_eq!(
+            CertificationElements::decode(&too_large).map_err(|error| error.code()),
+            Err(ErrorCode::CdInvalidFormat)
+        );
     }
 
     // ---- Signature verification tests ----
