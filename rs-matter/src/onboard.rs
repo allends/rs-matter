@@ -141,6 +141,61 @@ pub enum AttestationEvidence<'a> {
     },
 }
 
+/// Opaque evidence that phase 2 completed over an authenticated CASE session.
+///
+/// Values are captured from the library-owned session actually used to receive a
+/// successful `CommissioningComplete` response. Private fields make it impossible
+/// for applications to manufacture commissioning success from requested identity.
+///
+/// ```compile_fail
+/// use core::num::NonZeroU8;
+/// use rs_matter::onboard::CommissioningCaseProof;
+///
+/// let _forged = CommissioningCaseProof {
+///     controller_fabric_index: NonZeroU8::new(1).unwrap(),
+///     commissioned_node_id: 1,
+///     session_id: 1,
+///     local_session_id: 1,
+///     peer_session_id: 1,
+/// };
+/// ```
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct CommissioningCaseProof {
+    controller_fabric_index: NonZeroU8,
+    commissioned_node_id: NodeId,
+    session_id: u32,
+    local_session_id: u16,
+    peer_session_id: u16,
+}
+
+impl CommissioningCaseProof {
+    /// Controller-side fabric used by the authenticated CASE session.
+    pub const fn controller_fabric_index(&self) -> NonZeroU8 {
+        self.controller_fabric_index
+    }
+
+    /// Operational node authenticated by the CASE session.
+    pub const fn commissioned_node_id(&self) -> NodeId {
+        self.commissioned_node_id
+    }
+
+    /// Library-internal unique identity of the CASE session used for completion.
+    pub const fn session_id(&self) -> u32 {
+        self.session_id
+    }
+
+    /// Local protocol session identifier negotiated by CASE.
+    pub const fn local_session_id(&self) -> u16 {
+        self.local_session_id
+    }
+
+    /// Peer protocol session identifier negotiated by CASE.
+    pub const fn peer_session_id(&self) -> u16 {
+        self.peer_session_id
+    }
+}
+
 /// What [`Commissioner::commission`] returns on success.
 ///
 /// Also the handoff between phase 1 (`commission`) and phase 2
@@ -423,7 +478,10 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
     /// The sequence is attempted up to [`Self::with_case_attempts`] times: it
     /// runs immediately after the device was told to join its network, so losing
     /// the first race against the device coming online is routine.
-    pub async fn complete_via_case(&mut self, phase1: &CommissionResult) -> Result<(), Error> {
+    pub async fn complete_via_case(
+        &mut self,
+        phase1: &CommissionResult,
+    ) -> Result<CommissioningCaseProof, Error> {
         let fab_idx = self.fab_idx;
 
         let mut last_err = None;
@@ -433,7 +491,7 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
                 .commissioning_complete(fab_idx, phase1.device_node_id)
                 .await
             {
-                Ok(()) => return Ok(()),
+                Ok(proof) => return Ok(proof),
                 Err(err) if Self::phase2_worth_retrying(&err) => {
                     warn!(
                         "Commissioning phase 2 attempt {} failed: {}; retrying",
@@ -630,7 +688,7 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
         &self,
         fab_idx: NonZeroU8,
         peer_node_id: NodeId,
-    ) -> Result<(), Error> {
+    ) -> Result<CommissioningCaseProof, Error> {
         let exchange = Exchange::initiate_with_transport(
             self.matter,
             &self.crypto,
@@ -639,6 +697,18 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
             self.transport,
         )
         .await?;
+
+        let (session_id, local_session_id, peer_session_id) = exchange.with_state(|state| {
+            let session = exchange.id().session(&mut state.sessions);
+            if !session.is_for_node(fab_idx, peer_node_id) {
+                return Err(ErrorCode::InvalidState.into());
+            }
+            Ok((
+                session.id(),
+                session.get_local_sess_id(),
+                session.get_peer_sess_id(),
+            ))
+        })?;
 
         let handle = exchange
             .general_commissioning()
@@ -653,7 +723,13 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
             return Err(ErrorCode::Failure.into());
         }
 
-        Ok(())
+        Ok(CommissioningCaseProof {
+            controller_fabric_index: fab_idx,
+            commissioned_node_id: peer_node_id,
+            session_id,
+            local_session_id,
+            peer_session_id,
+        })
     }
 
     async fn verify_device_attestation<F>(

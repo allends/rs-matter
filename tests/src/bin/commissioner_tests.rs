@@ -309,7 +309,9 @@ async fn run_commission<C: Crypto>(
         let mut case_fut = pin!(select(case, mdns));
         let mut timeout = pin!(Timer::after(Duration::from_secs(COMMISSION_TIMEOUT_SECS)));
         match select(&mut case_fut, &mut timeout).await {
-            Either::First(Either::First(r)) => r?,
+            Either::First(Either::First(r)) => {
+                let _proof = r?;
+            }
             Either::First(Either::Second(_)) => {
                 unreachable!("the stub resolver never returns")
             }

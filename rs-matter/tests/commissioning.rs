@@ -575,10 +575,15 @@ async fn test_commission<C: Crypto>(
     // against.
     let mdns = stub_mdns_resolver_txt(matter, &mdns_table, if use_tcp { "6" } else { "" });
 
-    match select(pin!(commissioner.complete_via_case(&result)), pin!(mdns)).await {
+    let proof = match select(pin!(commissioner.complete_via_case(&result)), pin!(mdns)).await {
         Either::First(r) => r?,
         Either::Second(_) => unreachable!("the stub resolver never returns"),
-    }
+    };
+    assert_eq!(proof.controller_fabric_index(), controller_fab_idx);
+    assert_eq!(proof.commissioned_node_id(), result.device_node_id);
+    assert_ne!(proof.session_id(), 0);
+    assert_ne!(proof.local_session_id(), 0);
+    assert_ne!(proof.peer_session_id(), 0);
 
     info!(
         "complete_via_case() ok: controller_fab_idx={}, discovery+CASE+CommissioningComplete done",
