@@ -73,7 +73,9 @@ use rs_matter::im::IMStatusCode;
 use rs_matter::im::{InteractionModel, InteractionModelState};
 use rs_matter::onboard::cac::{IcacGenerator, RcacGenerator};
 use rs_matter::onboard::noc::NocGenerator;
-use rs_matter::onboard::{AttestationEvidence, CommissionOptions, Commissioner};
+use rs_matter::onboard::{
+    remove_fabric_via_case, AttestationEvidence, CommissionOptions, Commissioner,
+};
 use rs_matter::persist::DummyKvBlobStore;
 use rs_matter::respond::DefaultResponder;
 use rs_matter::sc::pase::MAX_COMM_WINDOW_TIMEOUT_SECS;
@@ -364,7 +366,7 @@ async fn run_controller_flow<C: Crypto>(
     let peer_addr = discover_and_resolve_device(use_tcp)?;
 
     info!("=== Phase 2: Commissioner — commission() (incl. PASE) + complete_via_case() ===");
-    let (controller_fab_idx, device_node_id) =
+    let (controller_fab_idx, device_fab_idx, device_node_id) =
         test_commission(matter, device_matter, crypto, peer_addr, use_tcp).await?;
 
     // Cherry on top: after `CommissioningComplete` the device has
@@ -376,14 +378,36 @@ async fn run_controller_flow<C: Crypto>(
     info!("=== Phase 4: IM Operations over the CASE session ===");
     test_onoff_cluster(matter, controller_fab_idx, device_node_id).await?;
 
+    info!("=== Phase 5: authenticated RemoveFabric proof ===");
+    let proof = remove_fabric_via_case(
+        matter,
+        crypto,
+        controller_fab_idx,
+        device_node_id,
+        device_fab_idx,
+    )
+    .await?;
+    assert_eq!(proof.controller_fabric_index(), controller_fab_idx);
+    assert_eq!(proof.peer_node_id(), device_node_id);
+    assert_eq!(proof.removed_fabric_index(), device_fab_idx);
+    assert_ne!(proof.session_id(), 0);
+    assert_ne!(proof.local_session_id(), 0);
+    assert_ne!(proof.peer_session_id(), 0);
+    assert!(matter
+        .with_state(|state| state.fabrics.fabric(controller_fab_idx).map(|_| ()))
+        .is_ok());
+    assert!(device_matter
+        .with_state(|state| state.fabrics.fabric(device_fab_idx).map(|_| ()))
+        .is_err());
+
     info!("=== All commissioning test phases completed successfully! ===");
     Ok(())
 }
 
 /// Drive both phases of the commissioner flow against the peer that
 /// PASE was just negotiated with. Returns the
-/// `(controller_local_fab_idx, device_node_id)` needed to open
-/// post-commissioning CASE exchanges.
+/// `(controller_local_fab_idx, device_peer_fab_idx, device_node_id)` needed
+/// for post-commissioning CASE exchanges and targeted fabric removal.
 ///
 /// All of the "build a fabric for the controller" plumbing lives in
 /// this test, not the `commissioner` crate: generate RCAC + ICAC,
@@ -398,7 +422,7 @@ async fn test_commission<C: Crypto>(
     crypto: &C,
     peer_addr: Address,
     use_tcp: bool,
-) -> Result<(core::num::NonZeroU8, u64), Error> {
+) -> Result<(core::num::NonZeroU8, core::num::NonZeroU8, u64), Error> {
     const FABRIC_ID: u64 = 1;
     // chip-tool's conventional admin NodeID; matches the
     // CaseAdminSubject the device-side ACL is seeded with.
@@ -590,7 +614,11 @@ async fn test_commission<C: Crypto>(
         controller_fab_idx,
     );
 
-    Ok((controller_fab_idx, result.device_node_id))
+    Ok((
+        controller_fab_idx,
+        result.fabric_index,
+        result.device_node_id,
+    ))
 }
 
 fn verify_test_evidence<C: Crypto>(

@@ -196,6 +196,190 @@ impl CommissioningCaseProof {
     }
 }
 
+/// Opaque evidence that `OperationalCredentials::RemoveFabric` completed
+/// successfully over the expected authenticated CASE session.
+///
+/// The proof is issued only by [`remove_fabric_via_case`] after the peer returns
+/// an `NOCResponse` with `OK` and echoes the exact requested fabric index. The
+/// CASE session identity is checked both before the invoke and after its
+/// acknowledgement completes.
+///
+/// ```compile_fail
+/// use core::num::NonZeroU8;
+/// use rs_matter::onboard::RemoveFabricCaseProof;
+///
+/// let _forged = RemoveFabricCaseProof {
+///     controller_fabric_index: NonZeroU8::new(1).unwrap(),
+///     peer_node_id: 1,
+///     removed_fabric_index: NonZeroU8::new(1).unwrap(),
+///     session_id: 1,
+///     local_session_id: 1,
+///     peer_session_id: 1,
+/// };
+/// ```
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct RemoveFabricCaseProof {
+    controller_fabric_index: NonZeroU8,
+    peer_node_id: NodeId,
+    removed_fabric_index: NonZeroU8,
+    session_id: u32,
+    local_session_id: u16,
+    peer_session_id: u16,
+}
+
+impl RemoveFabricCaseProof {
+    /// Controller-side fabric used to authenticate the CASE session.
+    pub const fn controller_fabric_index(&self) -> NonZeroU8 {
+        self.controller_fabric_index
+    }
+
+    /// Operational node authenticated by the CASE session.
+    pub const fn peer_node_id(&self) -> NodeId {
+        self.peer_node_id
+    }
+
+    /// Peer-side fabric slot that the successful command removed.
+    pub const fn removed_fabric_index(&self) -> NonZeroU8 {
+        self.removed_fabric_index
+    }
+
+    /// Library-internal unique identity of the CASE session used by the invoke.
+    pub const fn session_id(&self) -> u32 {
+        self.session_id
+    }
+
+    /// Local protocol session identifier negotiated by CASE.
+    pub const fn local_session_id(&self) -> u16 {
+        self.local_session_id
+    }
+
+    /// Peer protocol session identifier negotiated by CASE.
+    pub const fn peer_session_id(&self) -> u16 {
+        self.peer_session_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct CaseSessionIdentity {
+    session_id: u32,
+    local_session_id: u16,
+    peer_session_id: u16,
+}
+
+fn case_session_identity(
+    matter: &Matter<'_>,
+    session_id: u32,
+    controller_fabric_index: NonZeroU8,
+    peer_node_id: NodeId,
+) -> Result<CaseSessionIdentity, Error> {
+    matter.with_state(|state| {
+        let session = state.sessions.get(session_id).ok_or(ErrorCode::NoSession)?;
+
+        if !session.is_for_node(controller_fabric_index, peer_node_id) {
+            return Err(ErrorCode::InvalidState.into());
+        }
+
+        Ok(CaseSessionIdentity {
+            session_id: session.id(),
+            local_session_id: session.get_local_sess_id(),
+            peer_session_id: session.get_peer_sess_id(),
+        })
+    })
+}
+
+/// Invoke `OperationalCredentials::RemoveFabric` over authenticated CASE and
+/// return library-issued evidence of the exact successful operation.
+///
+/// This removes only the requested fabric on the peer. It does not mutate the
+/// controller's local fabric table and never falls back to factory reset.
+pub async fn remove_fabric_via_case<C: Crypto>(
+    matter: &Matter<'_>,
+    crypto: &C,
+    controller_fabric_index: NonZeroU8,
+    peer_node_id: NodeId,
+    peer_fabric_index: NonZeroU8,
+) -> Result<RemoveFabricCaseProof, Error> {
+    remove_fabric_via_case_with_transport(
+        matter,
+        crypto,
+        controller_fabric_index,
+        peer_node_id,
+        peer_fabric_index,
+        TransportPreference::default(),
+    )
+    .await
+}
+
+/// Transport-selecting variant of [`remove_fabric_via_case`].
+pub async fn remove_fabric_via_case_with_transport<C: Crypto>(
+    matter: &Matter<'_>,
+    crypto: &C,
+    controller_fabric_index: NonZeroU8,
+    peer_node_id: NodeId,
+    peer_fabric_index: NonZeroU8,
+    transport: TransportPreference,
+) -> Result<RemoveFabricCaseProof, Error> {
+    let exchange = Exchange::initiate_with_transport(
+        matter,
+        crypto,
+        controller_fabric_index,
+        peer_node_id,
+        transport,
+    )
+    .await?;
+
+    let exchange_id = exchange.id();
+    let identity = case_session_identity(
+        matter,
+        exchange_id.session_id(),
+        controller_fabric_index,
+        peer_node_id,
+    )?;
+
+    let handle = exchange
+        .operational_credentials()
+        .remove_fabric(ROOT_ENDPOINT_ID, |req| {
+            req.fabric_index(peer_fabric_index.get())?.end()
+        })
+        .await?;
+
+    let (status, response_fabric_index) = {
+        let response = handle.response()?;
+        (response.status_code()?, response.fabric_index()?)
+    };
+
+    handle.complete().await?;
+
+    if status != NodeOperationalCertStatusEnum::OK {
+        return Err(ErrorCode::Failure.into());
+    }
+
+    if response_fabric_index != Some(peer_fabric_index.get()) {
+        return Err(ErrorCode::InvalidData.into());
+    }
+
+    let completed_identity = case_session_identity(
+        matter,
+        identity.session_id,
+        controller_fabric_index,
+        peer_node_id,
+    )?;
+
+    if completed_identity != identity {
+        return Err(ErrorCode::InvalidState.into());
+    }
+
+    Ok(RemoveFabricCaseProof {
+        controller_fabric_index,
+        peer_node_id,
+        removed_fabric_index: peer_fabric_index,
+        session_id: identity.session_id,
+        local_session_id: identity.local_session_id,
+        peer_session_id: identity.peer_session_id,
+    })
+}
+
 /// What [`Commissioner::commission`] returns on success.
 ///
 /// Also the handoff between phase 1 (`commission`) and phase 2
