@@ -421,6 +421,18 @@ where
 ///   to a buffer.
 /// - `A`: an `Iterator<Item = IpAddr>` over the service's addresses.
 /// - `T`: an `Iterator<Item = (&str, &str)>` over the raw TXT key/value pairs.
+///
+/// Lifetime reported by the mDNS backend for the authoritative record that
+/// produced a resolved service. `Ttl(0)` is deliberately distinct from an
+/// unavailable lifetime because zero is DNS-SD's goodbye semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordLifetime {
+    /// Remaining DNS TTL in seconds, including zero (goodbye).
+    Ttl(u32),
+    /// The backend API does not expose record lifetime information.
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MdnsRemoteService<I, A, T> {
     /// The mDNS instance name, e.g. `ABCD1234._matterc._udp.local` for a
@@ -439,6 +451,8 @@ pub struct MdnsRemoteService<I, A, T> {
     /// without it. `0` (the kernel's own "unscoped" sentinel) when the backend
     /// can't supply it; only relevant for link-local IPv6 results.
     pub scope_id: u32,
+    /// Lifetime of the authoritative SRV (or PTR fallback) record.
+    pub lifetime: RecordLifetime,
 }
 
 impl<'a, I, A, T> MdnsRemoteService<I, A, T>

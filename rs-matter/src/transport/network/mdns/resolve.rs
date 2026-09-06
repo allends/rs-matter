@@ -219,6 +219,7 @@ impl ResolveMdns {
                         // address; use the link-local IPv6 one as the scope id
                         // so a `fe80::` result is routable.
                         scope_id: link_local_scope_id(addresses),
+                        lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                     });
             }
         }
@@ -247,6 +248,7 @@ impl ResolveMdns {
                         // address; use the link-local IPv6 one as the scope id
                         // so a `fe80::` result is routable.
                         scope_id: link_local_scope_id(addresses),
+                        lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                     },
                     // systemd-resolved owns the host A/AAAA records; this backend never
                     // sees the local interface addresses.

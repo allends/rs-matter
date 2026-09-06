@@ -146,6 +146,7 @@ impl AstroMdns {
                                     // DNS-SD reports the interface index; use it
                                     // as the scope id for a link-local result.
                                     scope_id: link_local_scope_id(&ips, svc.interface_index),
+                                    lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                                 },
                                 // The DNS-SD daemon owns the host A/AAAA records; this
                                 // backend never sees the local interface addresses.
@@ -212,6 +213,7 @@ impl AstroMdns {
                                     // DNS-SD reports the interface index; use it
                                     // as the scope id for a link-local result.
                                     scope_id: link_local_scope_id(&ips, service.interface_index),
+                                    lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                                 });
                         } else {
                             warn!("Could not resolve hostname: {}", service.hostname);

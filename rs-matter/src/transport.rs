@@ -2799,6 +2799,7 @@ mod resolve_tests {
                     addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))].into_iter(),
                     txt: [("SII", "300"), ("SAI", "4000"), ("SAT", "5000")].into_iter(),
                     scope_id: 0,
+                    lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                 };
 
                 matter.transport().try_deposit_mdns_resolve(&answer, &[]);
@@ -2850,6 +2851,7 @@ mod resolve_tests {
                     addrs: [IpAddr::V4(ipv4), IpAddr::V6(gua), IpAddr::V6(link_local)].into_iter(),
                     txt: core::iter::empty::<(&str, &str)>(),
                     scope_id: 7,
+                    lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                 };
 
                 matter.transport().try_deposit_mdns_resolve(&answer, &[]);
@@ -2906,6 +2908,7 @@ mod resolve_tests {
                         addrs: core::iter::once(IpAddr::V6(gua)),
                         txt: [("SII", "300")].into_iter(),
                         scope_id: 0,
+                        lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                     },
                     &[],
                 );
@@ -2918,6 +2921,7 @@ mod resolve_tests {
                         addrs: core::iter::once(IpAddr::V6(link_local)),
                         txt: core::iter::empty::<(&str, &str)>(),
                         scope_id: 7,
+                        lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                     },
                     &[],
                 );
@@ -2968,6 +2972,7 @@ mod resolve_tests {
             addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))].into_iter(),
             txt: core::iter::empty::<(&str, &str)>(),
             scope_id: 0,
+            lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
         };
         matter.transport().try_deposit_mdns_resolve(&answer, &[]);
 
@@ -3016,6 +3021,7 @@ mod browse_tests {
                     addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))].into_iter(),
                     txt: [("D", "2650"), ("VP", "9999+1"), ("CM", "1")].into_iter(),
                     scope_id: 0,
+                    lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                 };
                 matter.transport().try_deposit_mdns_browse(&other);
 
@@ -3026,6 +3032,7 @@ mod browse_tests {
                     addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))].into_iter(),
                     txt: [("D", "2650"), ("VP", "65521+42"), ("CM", "1")].into_iter(),
                     scope_id: 0,
+                    lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                 };
                 matter.transport().try_deposit_mdns_browse(&answer);
             };
@@ -3090,6 +3097,7 @@ mod browse_tests {
                     addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))].into_iter(),
                     txt: [("D", "2578"), ("CM", "1")].into_iter(), // 0xA12, short 0xA
                     scope_id: 0,
+                    lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                 };
                 // Excluded id -> ignored.
                 matter.transport().try_deposit_mdns_browse(&node_a);
@@ -3100,6 +3108,7 @@ mod browse_tests {
                     addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))].into_iter(),
                     txt: [("D", "2815"), ("CM", "1")].into_iter(), // 0xAFF, short 0xA
                     scope_id: 0,
+                    lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                 };
                 matter.transport().try_deposit_mdns_browse(&node_b);
             };

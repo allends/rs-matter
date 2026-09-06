@@ -31,7 +31,7 @@ use domain::rdata::{Aaaa, Ptr, Srv, A};
 
 use crate::error::Error;
 use crate::transport::network::mdns::builtin::types::Buf;
-use crate::transport::network::mdns::MdnsRemoteService;
+use crate::transport::network::mdns::{MdnsRemoteService, RecordLifetime};
 use crate::transport::network::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Build an mDNS browse query: a PTR question against a service type
@@ -214,6 +214,7 @@ pub fn parse_into_answer(
     let mut hostname: Option<ParsedName<&[u8]>> = None;
     let mut port: Option<u16> = None;
     let mut have_srv = false;
+    let mut lifetime = RecordLifetime::Unavailable;
 
     for section in [msg.answer(), msg.additional()] {
         let Ok(section) = section else { continue };
@@ -226,9 +227,11 @@ pub fn parse_into_answer(
                 hostname = Some(*rec.data().target());
                 port = Some(rec.data().port());
                 have_srv = true;
+                lifetime = RecordLifetime::Ttl(rec.ttl().as_secs());
             } else if !have_srv && instance.is_none() {
                 if let Ok(Some(rec)) = record.to_record::<Ptr<_>>() {
                     instance = Some(*rec.data().ptrdname());
+                    lifetime = RecordLifetime::Ttl(rec.ttl().as_secs());
                 }
             }
         }
@@ -274,6 +277,7 @@ pub fn parse_into_answer(
         // link-local AAAA result is reachable through it: stamp that interface
         // index as the IPv6 scope id (`0` = unscoped, when none was configured).
         scope_id: ipv6_scope.unwrap_or(0),
+        lifetime,
     }))
 }
 
@@ -353,6 +357,7 @@ mod tests {
         // A configured IPv6 interface index is threaded through as the scope id.
         let answer = parse_into_answer(&buf[..len], Some(7)).unwrap().unwrap();
         assert_eq!(answer.scope_id, 7);
+        assert_eq!(answer.lifetime, RecordLifetime::Ttl(60));
 
         assert_eq!(
             name_str(answer.instance_name).as_str(),
@@ -399,5 +404,23 @@ mod tests {
         assert_eq!(answer.port, Some(5540));
         assert_eq!(answer.scope_id, 0);
         assert_eq!(answer.txt.count(), 0);
+    }
+    #[test]
+    fn preserves_zero_ttl_goodbye() {
+        let mut buf = [0u8; 1024];
+        let service = MdnsLocalService {
+            name: "ABCD1234",
+            service: "_matterc",
+            protocol: "_udp",
+            service_protocol: "_matterc._udp",
+            port: 5540,
+            service_subtypes: core::iter::empty(),
+            txt_kvs: core::iter::empty::<(&str, &str)>(),
+        };
+        let len = host().broadcast(&service, &mut buf, 60, 0).unwrap();
+
+        let answer = parse_into_answer(&buf[..len], None).unwrap().unwrap();
+        assert_eq!(answer.lifetime, RecordLifetime::Ttl(0));
+        assert_ne!(answer.lifetime, RecordLifetime::Unavailable);
     }
 }
