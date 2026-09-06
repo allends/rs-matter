@@ -668,7 +668,7 @@ impl CommissionableFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
-enum CommissioningMode {
+pub enum CommissioningMode {
     /// Device is not in commissioning mode
     #[default]
     Disabled = 0,
@@ -689,7 +689,7 @@ impl CommissioningMode {
     }
 
     /// Returns true if the device is in any commissioning mode.
-    fn is_commissionable(&self) -> bool {
+    pub fn is_commissionable(&self) -> bool {
         !matches!(self, Self::Disabled)
     }
 }
@@ -747,6 +747,45 @@ pub struct ResolvedNode {
     pub sai: Option<u32>,
     /// Session Active Threshold (`SAT`), milliseconds.
     pub sat: Option<u16>,
+}
+
+/// Owned, bounded identity evidence for one commissionable DNS-SD instance.
+///
+/// Every value is parsed from the answer itself. Query filters are never copied
+/// into an observation. Required or conflicting identity TXT records make the
+/// answer unusable rather than producing partial or synthetic identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommissionableObservation {
+    /// Parsed commissionable instance label.
+    pub instance_id: u64,
+    /// Advertised 12-bit `D` discriminator.
+    pub discriminator: u16,
+    /// Upper four bits of the advertised `D` value.
+    pub short_discriminator: u8,
+    /// Advertised vendor id from `VP`.
+    pub vendor_id: u16,
+    /// Advertised product id from `VP`, when present.
+    pub product_id: Option<u16>,
+    /// Advertised device type (`DT`), when present.
+    pub device_type: Option<u32>,
+    /// Advertised commissioning mode (`CM`).
+    pub commissioning_mode: CommissioningMode,
+    /// Canonical, ranked, scoped socket addresses from this answer.
+    pub addrs: Vec<SocketAddr, MAX_RESOLVE_CANDIDATES>,
+    /// Lifetime evidence supplied by the backend.
+    pub lifetime: RecordLifetime,
+}
+
+impl CommissionableObservation {
+    /// The best-ranked advertised address.
+    pub fn addr(&self) -> Option<SocketAddr> {
+        self.addrs.first().copied()
+    }
+
+    /// Whether the observation carries usable, live lifetime evidence.
+    pub fn has_live_lifetime(&self) -> bool {
+        matches!(self.lifetime, RecordLifetime::Ttl(ttl) if ttl > 0)
+    }
 }
 
 impl ResolvedNode {
@@ -920,14 +959,7 @@ pub(crate) enum MdnsBrowseState {
         exclude: BrowseExclude,
     },
     /// The responder deposited the first matching, non-excluded commissionable node.
-    Found {
-        ip: IpAddr,
-        port: u16,
-        /// IPv6 scope (zone) id for a link-local `ip`; 0 otherwise. See
-        /// [`MdnsRemoteService::scope_id`].
-        scope_id: u32,
-        id: u64,
-    },
+    Found(CommissionableObservation),
 }
 
 /// Score an IP address for prioritization; higher is more preferred.
