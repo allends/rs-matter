@@ -384,6 +384,16 @@ pub async fn remove_fabric_via_case_with_transport<C: Crypto>(
 ///
 /// Also the handoff between phase 1 (`commission`) and phase 2
 /// ([`Commissioner::complete_via_case`]).
+/// Authenticated commissioning milestones emitted by [`Commissioner`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommissioningProgress {
+    EstablishingPase,
+    Attesting,
+    RequestingCsr,
+    /// Emitted immediately before AddTrustedRootCertificate / AddNOC.
+    InstallingOperationalCredentials,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct CommissionResult {
@@ -565,14 +575,46 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
     where
         F: for<'e> FnMut(AttestationEvidence<'e>) -> Result<(), Error>,
     {
+        self.commission_with_attestation_and_progress(
+            peer_addr,
+            passcode,
+            opts,
+            device_node_id,
+            validity,
+            verify,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    /// Production-oriented phase-one commissioning with authenticated evidence and a synchronous
+    /// progress boundary. The irreversible callback runs immediately before any operational
+    /// credential is sent, allowing callers to durably checkpoint before remote mutation.
+    pub async fn commission_with_attestation_and_progress<F, P>(
+        &mut self,
+        peer_addr: Address,
+        passcode: u32,
+        opts: &CommissionOptions,
+        device_node_id: NodeId,
+        validity: Validity,
+        verify: F,
+        mut progress: P,
+    ) -> Result<CommissionResult, Error>
+    where
+        F: for<'e> FnMut(AttestationEvidence<'e>) -> Result<(), Error>,
+        P: FnMut(CommissioningProgress) -> Result<(), Error>,
+    {
+        progress(CommissioningProgress::EstablishingPase)?;
         self.arm_fail_safe(peer_addr, passcode, opts.fail_safe_secs)
             .await?;
 
         let mut attestation_nonce = [0u8; 32];
         self.crypto.rand()?.fill_bytes(&mut attestation_nonce);
+        progress(CommissioningProgress::Attesting)?;
         self.verify_device_attestation(peer_addr, passcode, &attestation_nonce, verify)
             .await?;
 
+        progress(CommissioningProgress::RequestingCsr)?;
         // CSRRequest: random 32B nonce, then validate the device's echo
         // and mint the operational NOC in the same scope where the CSR
         // is borrowed from the response RX buffer — no per-call staging
@@ -603,6 +645,7 @@ impl<'a, C: Crypto> Commissioner<'a, C> {
         // + table lookup) keep the staging buffer to a single
         // `MAX_CERT_TLV_LEN` slot. IPK is a 16-byte fixed-size stack
         // array — trivial.
+        progress(CommissioningProgress::InstallingOperationalCredentials)?;
         let rcac_len = matter.with_state(|state| {
             let fabric = state.fabrics.fabric(fab_idx)?;
             let rcac = fabric.root_ca();
