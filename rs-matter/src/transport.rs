@@ -47,8 +47,9 @@ use crate::sc::{sc_write, OpCode, SCStatusCodes, StatusReport, PROTO_ID_SECURE_C
 use crate::tlv::TLVElement;
 use crate::transport::network::mdns::{
     commissionable_instance_id, merge_resolve_candidate, score_ip_address,
-    score_ip_address_on_link, BrowseExclude, CommissionableFilter, MdnsBrowseState,
-    MdnsRemoteService, MdnsResolveState, ResolvedAddr, ResolvedNode, MAX_RESOLVE_CANDIDATES,
+    score_ip_address_on_link, BrowseExclude, CommissionableFilter, CommissionableObservation,
+    CommissioningMode, MdnsBrowseState, MdnsRemoteService, MdnsResolveState, ResolvedAddr,
+    ResolvedNode, MAX_RESOLVE_CANDIDATES,
 };
 use crate::transport::network::{MatterRemoteService, NetworkMulticast};
 use crate::utils::cell::RefCell;
@@ -544,12 +545,26 @@ impl Transport {
         exclude: &[u64],
         timeout_ms: u32,
     ) -> Result<(Address, u64), Error> {
+        let observation = self
+            .browse_commissionable_observation(filter, exclude, timeout_ms)
+            .await?;
+        let addr = observation.addr().ok_or(ErrorCode::NotFound)?;
+
+        Ok((Address::Udp(addr), observation.instance_id))
+    }
+
+    /// Browse for owned, typed commissionable identity and lifetime evidence.
+    pub async fn browse_commissionable_observation(
+        &self,
+        filter: &CommissionableFilter,
+        exclude: &[u64],
+        timeout_ms: u32,
+    ) -> Result<CommissionableObservation, Error> {
         let mut exclude_vec = BrowseExclude::new();
         exclude_vec
             .extend_from_slice(exclude)
             .map_err(|_| ErrorCode::ResourceExhausted)?;
 
-        // 1. Serialize with other browsers and place the request.
         self.mdns_browse
             .wait(|state| {
                 if matches!(state, MdnsBrowseState::Idle) {
@@ -564,36 +579,24 @@ impl Transport {
             })
             .await;
 
-        // 2. Release the slot if this future is dropped (or times out).
         let mut guard = MdnsBrowseGuard {
             signal: &self.mdns_browse,
             armed: true,
         };
 
-        // 3. Wait for the first matching, non-excluded commissionable node, or time out.
         let mut wait = pin!(self.mdns_browse.wait(|state| match state {
-            MdnsBrowseState::Found {
-                ip,
-                port,
-                scope_id,
-                id,
-            } => {
-                let found = (
-                    Address::Udp(Self::scoped_socket_addr(*ip, *port, *scope_id)),
-                    *id,
-                );
+            MdnsBrowseState::Found(observation) => {
+                let found = observation.clone();
                 *state = MdnsBrowseState::Idle;
                 Some(found)
             }
             _ => None,
         }));
-
         let mut timer = pin!(Timer::after(Duration::from_millis(timeout_ms as u64)));
 
         match select(&mut wait, &mut timer).await {
             Either::First(found) => {
                 guard.armed = false;
-
                 Ok(found)
             }
             Either::Second(_) => Err(ErrorCode::NotFound.into()),
@@ -649,49 +652,138 @@ impl Transport {
         A: Iterator<Item = IpAddr> + Clone,
         T: Iterator<Item = (&'a str, &'a str)> + Clone,
     {
-        let Some(id) = commissionable_instance_id(&answer.instance_name) else {
+        let Some(observation) = Self::commissionable_observation(answer) else {
             return;
         };
-        let Some(ip) = answer.addrs.clone().max_by_key(score_ip_address) else {
-            return;
-        };
-        let Some(port) = answer.port else {
-            return;
-        };
-        let scope_id = answer.scope_id;
+        let id = observation.instance_id;
 
         self.mdns_browse.modify(|state| match state {
             MdnsBrowseState::InFlight { filter, exclude }
                 if !exclude.contains(&id) && filter.matches(answer) =>
             {
-                *state = MdnsBrowseState::Found {
-                    ip,
-                    port,
-                    scope_id,
-                    id,
-                };
+                *state = MdnsBrowseState::Found(observation);
                 (true, ())
             }
-            // Already matched this same instance but not yet consumed: keep the
-            // better-scoring address. Backends that surface one address per
-            // family at a time (e.g. zeroconf fires a callback per A/AAAA record)
-            // can thus still yield the preferred IPv6 address even if the IPv4
-            // one was deposited first.
-            MdnsBrowseState::Found {
-                ip: cur_ip,
-                id: cur_id,
-                ..
-            } if *cur_id == id && score_ip_address(&ip) > score_ip_address(cur_ip) => {
-                *state = MdnsBrowseState::Found {
-                    ip,
-                    port,
-                    scope_id,
-                    id,
-                };
-                (true, ())
+            MdnsBrowseState::Found(current)
+                if current.instance_id == id
+                    && current.discriminator == observation.discriminator
+                    && current.vendor_id == observation.vendor_id
+                    && current.product_id == observation.product_id
+                    && current.device_type == observation.device_type
+                    && current.commissioning_mode == observation.commissioning_mode
+                    && current.lifetime == observation.lifetime =>
+            {
+                let mut changed = false;
+                for addr in observation.addrs {
+                    if current.addrs.contains(&addr) {
+                        continue;
+                    }
+                    let score = score_ip_address(&addr.ip());
+                    let position = current
+                        .addrs
+                        .iter()
+                        .position(|candidate| score_ip_address(&candidate.ip()) < score)
+                        .unwrap_or(current.addrs.len());
+                    if position >= MAX_RESOLVE_CANDIDATES {
+                        continue;
+                    }
+                    if current.addrs.is_full() {
+                        current.addrs.pop();
+                    }
+                    if current.addrs.insert(position, addr).is_ok() {
+                        changed = true;
+                    }
+                }
+                (changed, ())
             }
             _ => (false, ()),
         });
+    }
+
+    fn commissionable_observation<'a, I, A, T>(
+        answer: &MdnsRemoteService<I, A, T>,
+    ) -> Option<CommissionableObservation>
+    where
+        I: ToLabelIter,
+        A: Iterator<Item = IpAddr> + Clone,
+        T: Iterator<Item = (&'a str, &'a str)> + Clone,
+    {
+        let instance_id = commissionable_instance_id(&answer.instance_name)?;
+        let port = answer.port?;
+        let mut discriminator = None;
+        let mut vendor_product = None;
+        let mut device_type = None;
+        let mut commissioning_mode = None;
+
+        for (key, value) in answer.txt.clone() {
+            let slot = if key.eq_ignore_ascii_case("D") {
+                &mut discriminator
+            } else if key.eq_ignore_ascii_case("VP") {
+                &mut vendor_product
+            } else if key.eq_ignore_ascii_case("DT") {
+                &mut device_type
+            } else if key.eq_ignore_ascii_case("CM") {
+                &mut commissioning_mode
+            } else {
+                continue;
+            };
+            if slot.as_ref().is_some_and(|previous| *previous != value) {
+                return None;
+            }
+            *slot = Some(value);
+        }
+
+        let discriminator = discriminator?.parse::<u16>().ok().filter(|d| *d <= 0xFFF)?;
+        let (vendor, product) = match vendor_product?.split_once('+') {
+            Some((vendor, product)) => (vendor, Some(product)),
+            None => (vendor_product?, None),
+        };
+        let vendor_id = vendor.parse().ok()?;
+        let product_id = product.map(str::parse).transpose().ok()?;
+        let device_type = device_type.map(str::parse).transpose().ok()?;
+        let commissioning_mode = match commissioning_mode? {
+            "0" => CommissioningMode::Disabled,
+            "1" => CommissioningMode::Basic,
+            "2" => CommissioningMode::Enhanced,
+            _ => return None,
+        };
+
+        let mut ranked = Vec::<ResolvedAddr, MAX_RESOLVE_CANDIDATES>::new();
+        for ip in answer.addrs.clone() {
+            merge_resolve_candidate(
+                &mut ranked,
+                ResolvedAddr {
+                    ip,
+                    scope_id: answer.scope_id,
+                    score: score_ip_address(&ip),
+                },
+            );
+        }
+        let mut addrs = Vec::new();
+        for candidate in ranked {
+            addrs
+                .push(Self::scoped_socket_addr(
+                    candidate.ip,
+                    port,
+                    candidate.scope_id,
+                ))
+                .ok()?;
+        }
+        if addrs.is_empty() {
+            return None;
+        }
+
+        Some(CommissionableObservation {
+            instance_id,
+            discriminator,
+            short_discriminator: (discriminator >> 8) as u8,
+            vendor_id,
+            product_id,
+            device_type,
+            commissioning_mode,
+            addrs,
+            lifetime: answer.lifetime,
+        })
     }
 
     pub(crate) async fn accept_if<'a, F>(
@@ -2799,6 +2891,7 @@ mod resolve_tests {
                     addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))].into_iter(),
                     txt: [("SII", "300"), ("SAI", "4000"), ("SAT", "5000")].into_iter(),
                     scope_id: 0,
+                    lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                 };
 
                 matter.transport().try_deposit_mdns_resolve(&answer, &[]);
@@ -2850,6 +2943,7 @@ mod resolve_tests {
                     addrs: [IpAddr::V4(ipv4), IpAddr::V6(gua), IpAddr::V6(link_local)].into_iter(),
                     txt: core::iter::empty::<(&str, &str)>(),
                     scope_id: 7,
+                    lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                 };
 
                 matter.transport().try_deposit_mdns_resolve(&answer, &[]);
@@ -2906,6 +3000,7 @@ mod resolve_tests {
                         addrs: core::iter::once(IpAddr::V6(gua)),
                         txt: [("SII", "300")].into_iter(),
                         scope_id: 0,
+                        lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                     },
                     &[],
                 );
@@ -2918,6 +3013,7 @@ mod resolve_tests {
                         addrs: core::iter::once(IpAddr::V6(link_local)),
                         txt: core::iter::empty::<(&str, &str)>(),
                         scope_id: 7,
+                        lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                     },
                     &[],
                 );
@@ -2968,6 +3064,7 @@ mod resolve_tests {
             addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))].into_iter(),
             txt: core::iter::empty::<(&str, &str)>(),
             scope_id: 0,
+            lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
         };
         matter.transport().try_deposit_mdns_resolve(&answer, &[]);
 
@@ -2978,14 +3075,104 @@ mod resolve_tests {
 
 #[cfg(test)]
 mod browse_tests {
-    use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
     use futures_lite::future::{block_on, zip};
 
     use crate::error::ErrorCode;
     use crate::test::test_matter;
-    use crate::transport::network::mdns::{CommissionableFilter, DottedName, MdnsRemoteService};
+    use crate::transport::network::mdns::{
+        CommissionableFilter, CommissioningMode, DottedName, MdnsRemoteService, RecordLifetime,
+    };
     use crate::transport::network::Address;
+
+    #[test]
+    fn typed_observation_preserves_advertised_identity_addresses_and_lifetime() {
+        let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 7);
+        let full = MdnsRemoteService {
+            instance_name: DottedName("00000000ABCDEF01._matterc._udp.local"),
+            port: Some(5540),
+            addrs: [
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)),
+                IpAddr::V6(link_local),
+            ]
+            .into_iter(),
+            txt: [
+                ("D", "2650"),
+                ("VP", "65521+42"),
+                ("DT", "259"),
+                ("CM", "2"),
+            ]
+            .into_iter(),
+            scope_id: 7,
+            lifetime: RecordLifetime::Ttl(120),
+        };
+        let observation = super::Transport::commissionable_observation(&full).unwrap();
+        assert_eq!(observation.instance_id, 0xABCDEF01);
+        assert_eq!(observation.discriminator, 0xA5A);
+        assert_eq!(observation.short_discriminator, 0xA);
+        assert_eq!(observation.vendor_id, 0xFFF1);
+        assert_eq!(observation.product_id, Some(42));
+        assert_eq!(observation.device_type, Some(259));
+        assert_eq!(observation.commissioning_mode, CommissioningMode::Enhanced);
+        assert_eq!(observation.lifetime, RecordLifetime::Ttl(120));
+        assert!(observation.has_live_lifetime());
+        assert_eq!(
+            observation.addr(),
+            Some(SocketAddr::V6(SocketAddrV6::new(link_local, 5540, 0, 7)))
+        );
+        assert!(observation.addrs.contains(&SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)),
+            5540
+        )));
+
+        let omitted = MdnsRemoteService {
+            instance_name: DottedName("00000000ABCDEF02._matterc._udp.local"),
+            port: Some(5541),
+            addrs: [IpAddr::V4(Ipv4Addr::LOCALHOST)].into_iter(),
+            txt: [("D", "1"), ("VP", "123"), ("CM", "1")].into_iter(),
+            scope_id: 0,
+            lifetime: RecordLifetime::Ttl(0),
+        };
+        let omitted = super::Transport::commissionable_observation(&omitted).unwrap();
+        assert_eq!(omitted.instance_id, 0xABCDEF02);
+        assert_eq!(omitted.product_id, None);
+        assert_eq!(omitted.device_type, None);
+        assert!(!omitted.has_live_lifetime());
+
+        let unavailable = MdnsRemoteService {
+            instance_name: DottedName("00000000ABCDEF03._matterc._udp.local"),
+            port: Some(5542),
+            addrs: [IpAddr::V4(Ipv4Addr::LOCALHOST)].into_iter(),
+            txt: [("D", "2"), ("VP", "124+7"), ("CM", "0")].into_iter(),
+            scope_id: 0,
+            lifetime: RecordLifetime::Unavailable,
+        };
+        let unavailable = super::Transport::commissionable_observation(&unavailable).unwrap();
+        assert_eq!(unavailable.instance_id, 0xABCDEF03);
+        assert!(!unavailable.has_live_lifetime());
+        assert_ne!(omitted.instance_id, unavailable.instance_id);
+
+        let conflicting = MdnsRemoteService {
+            instance_name: DottedName("00000000ABCDEF04._matterc._udp.local"),
+            port: Some(5540),
+            addrs: [IpAddr::V4(Ipv4Addr::LOCALHOST)].into_iter(),
+            txt: [("D", "1"), ("d", "2"), ("VP", "1+1"), ("CM", "1")].into_iter(),
+            scope_id: 0,
+            lifetime: RecordLifetime::Ttl(1),
+        };
+        assert!(super::Transport::commissionable_observation(&conflicting).is_none());
+
+        let missing_required = MdnsRemoteService {
+            instance_name: DottedName("00000000ABCDEF05._matterc._udp.local"),
+            port: Some(5540),
+            addrs: [IpAddr::V4(Ipv4Addr::LOCALHOST)].into_iter(),
+            txt: [("D", "1"), ("CM", "1")].into_iter(),
+            scope_id: 0,
+            lifetime: RecordLifetime::Ttl(1),
+        };
+        assert!(super::Transport::commissionable_observation(&missing_required).is_none());
+    }
 
     /// A browser and the responder rendezvous: the responder picks up the request,
     /// deposits a matching commissionable answer, and the browser returns its
@@ -3016,6 +3203,7 @@ mod browse_tests {
                     addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))].into_iter(),
                     txt: [("D", "2650"), ("VP", "9999+1"), ("CM", "1")].into_iter(),
                     scope_id: 0,
+                    lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                 };
                 matter.transport().try_deposit_mdns_browse(&other);
 
@@ -3026,6 +3214,7 @@ mod browse_tests {
                     addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))].into_iter(),
                     txt: [("D", "2650"), ("VP", "65521+42"), ("CM", "1")].into_iter(),
                     scope_id: 0,
+                    lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                 };
                 matter.transport().try_deposit_mdns_browse(&answer);
             };
@@ -3088,8 +3277,9 @@ mod browse_tests {
                     instance_name: DottedName("0000000000001111._matterc._udp.local"),
                     port: Some(5540),
                     addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))].into_iter(),
-                    txt: [("D", "2578"), ("CM", "1")].into_iter(), // 0xA12, short 0xA
+                    txt: [("D", "2578"), ("VP", "1+1"), ("CM", "1")].into_iter(), // 0xA12, short 0xA
                     scope_id: 0,
+                    lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                 };
                 // Excluded id -> ignored.
                 matter.transport().try_deposit_mdns_browse(&node_a);
@@ -3098,8 +3288,9 @@ mod browse_tests {
                     instance_name: DottedName("0000000000002222._matterc._udp.local"),
                     port: Some(5541),
                     addrs: [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))].into_iter(),
-                    txt: [("D", "2815"), ("CM", "1")].into_iter(), // 0xAFF, short 0xA
+                    txt: [("D", "2815"), ("VP", "1+2"), ("CM", "1")].into_iter(), // 0xAFF, short 0xA
                     scope_id: 0,
+                    lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                 };
                 matter.transport().try_deposit_mdns_browse(&node_b);
             };

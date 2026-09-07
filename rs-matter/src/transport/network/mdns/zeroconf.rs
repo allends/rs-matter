@@ -149,6 +149,8 @@ impl ZeroconfMdns {
                                 // (`fe80::`) results are unscoped here. Other
                                 // backends (avahi, resolve, astro) thread it.
                                 scope_id: 0,
+                                lifetime:
+                                    crate::transport::network::mdns::RecordLifetime::Unavailable,
                             },
                             // The mDNS daemon owns the host A/AAAA records; this backend
                             // never sees the local interface addresses.
@@ -189,6 +191,8 @@ impl ZeroconfMdns {
                                 // (`fe80::`) results are unscoped here. Other
                                 // backends (avahi, resolve, astro) thread it.
                                 scope_id: 0,
+                                lifetime:
+                                    crate::transport::network::mdns::RecordLifetime::Unavailable,
                             });
                     }
                 });

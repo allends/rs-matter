@@ -278,6 +278,7 @@ pub async fn stub_mdns_resolver_txt(
                 addrs: core::iter::once(IpAddr::V6(*sock.ip())),
                 txt: (!tcp.is_empty()).then_some(("T", tcp)).into_iter(),
                 scope_id: 0,
+                lifetime: rs_matter::transport::network::mdns::RecordLifetime::Unavailable,
             },
             &[],
         );

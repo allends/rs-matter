@@ -40,6 +40,7 @@
 ))]
 
 use core::pin::pin;
+use core::sync::atomic::{AtomicU8, Ordering};
 use std::net::{TcpListener, UdpSocket};
 
 use embassy_futures::select::{select, select3, Either};
@@ -52,26 +53,33 @@ use rand_core::RngCore;
 use rs_matter::cert::gen::VALID_FOREVER;
 use rs_matter::cert::{MAX_CERT_TLV_AND_ASN1_LEN, MAX_CERT_TLV_LEN};
 use rs_matter::crypto::{
-    test_only_crypto, CanonAeadKey, CanonPkcSecretKey, Crypto, SecretKey, SigningSecretKey,
+    test_only_crypto, CanonAeadKey, CanonPkcSecretKey, CanonPkcSignatureRef, Crypto, PublicKey,
+    SecretKey, SigningSecretKey,
 };
 use rs_matter::dm::clusters::app::level_control::LevelControlHooks;
 use rs_matter::dm::clusters::app::on_off::{self, test::TestOnOffDeviceLogic, OnOffHooks};
 use rs_matter::dm::clusters::desc::{self, ClusterHandler as _};
+use rs_matter::dm::clusters::dev_att::DeviceAttestation;
 use rs_matter::dm::clusters::net_comm::DummyNetworks;
+use rs_matter::dm::clusters::noc::OperationalCredentialsClient;
 use rs_matter::dm::devices::test::{TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET};
 use rs_matter::dm::devices::DEV_TYPE_ON_OFF_LIGHT;
+use rs_matter::dm::endpoints::ROOT_ENDPOINT_ID;
 use rs_matter::dm::networks::unix::UnixNetifs;
 use rs_matter::dm::{endpoints, Async, DataModel, Dataver, Endpoint, EpClMatcher, Node};
-use rs_matter::error::Error;
+use rs_matter::error::{Error, ErrorCode};
 use rs_matter::im::subscriptions::DEFAULT_MAX_SUBSCRIPTIONS;
 use rs_matter::im::IMStatusCode;
 use rs_matter::im::{InteractionModel, InteractionModelState};
 use rs_matter::onboard::cac::{IcacGenerator, RcacGenerator};
 use rs_matter::onboard::noc::NocGenerator;
-use rs_matter::onboard::{CommissionOptions, Commissioner};
+use rs_matter::onboard::{
+    remove_fabric_via_case, AttestationEvidence, CommissionOptions, Commissioner,
+};
 use rs_matter::persist::DummyKvBlobStore;
 use rs_matter::respond::DefaultResponder;
 use rs_matter::sc::pase::MAX_COMM_WINDOW_TIMEOUT_SECS;
+use rs_matter::tlv::{FromTLV, OctetStr, TLVElement};
 use rs_matter::transport::exchange::Exchange;
 use rs_matter::transport::exchange::MatterBuffers;
 use rs_matter::transport::network::tcp::TcpNetwork;
@@ -79,6 +87,7 @@ use rs_matter::transport::network::{Address, NoNetwork, SocketAddr, SocketAddrV6
 use rs_matter::transport::{TransportPreference, MATTER_SOCKET_BIND_ADDR};
 use rs_matter::utils::init::InitMaybeUninit;
 use rs_matter::utils::select::Coalesce;
+use rs_matter::utils::sync::DynBase;
 use rs_matter::{clusters, devices, root_endpoint, Matter, MATTER_PORT};
 
 use socket2::{Domain, Protocol, Socket, Type};
@@ -110,6 +119,63 @@ static TCP_DEVICE_MATTER: StaticCell<Matter> = StaticCell::new();
 static TCP_DEVICE_BUFFERS: StaticCell<MatterBuffers> = StaticCell::new();
 static TCP_DEVICE_STATE: StaticCell<DeviceDmState> = StaticCell::new();
 static TCP_CTRL_MATTER: StaticCell<Matter> = StaticCell::new();
+
+struct RecordingDeviceAttestation {
+    dac_calls: AtomicU8,
+    pai_calls: AtomicU8,
+    cert_declaration_calls: AtomicU8,
+    dac_private_key_calls: AtomicU8,
+}
+
+impl RecordingDeviceAttestation {
+    const fn new() -> Self {
+        Self {
+            dac_calls: AtomicU8::new(0),
+            pai_calls: AtomicU8::new(0),
+            cert_declaration_calls: AtomicU8::new(0),
+            dac_private_key_calls: AtomicU8::new(0),
+        }
+    }
+
+    fn calls(&self) -> (u8, u8, u8, u8) {
+        (
+            self.dac_calls.load(Ordering::SeqCst),
+            self.pai_calls.load(Ordering::SeqCst),
+            self.cert_declaration_calls.load(Ordering::SeqCst),
+            self.dac_private_key_calls.load(Ordering::SeqCst),
+        )
+    }
+}
+
+impl DynBase for RecordingDeviceAttestation {}
+
+impl DeviceAttestation for RecordingDeviceAttestation {
+    fn cert_declaration(&self) -> &[u8] {
+        self.cert_declaration_calls.fetch_add(1, Ordering::SeqCst);
+        TEST_DEV_ATT.cert_declaration()
+    }
+
+    fn pai(&self) -> &[u8] {
+        self.pai_calls.fetch_add(1, Ordering::SeqCst);
+        TEST_DEV_ATT.pai()
+    }
+
+    fn dac(&self) -> &[u8] {
+        self.dac_calls.fetch_add(1, Ordering::SeqCst);
+        TEST_DEV_ATT.dac()
+    }
+
+    fn dac_pub_key(&self) -> rs_matter::crypto::CanonPkcPublicKeyRef<'_> {
+        TEST_DEV_ATT.dac_pub_key()
+    }
+
+    fn dac_priv_key(&self) -> rs_matter::crypto::CanonPkcSecretKeyRef<'_> {
+        self.dac_private_key_calls.fetch_add(1, Ordering::SeqCst);
+        TEST_DEV_ATT.dac_priv_key()
+    }
+}
+
+static UDP_DEV_ATT: RecordingDeviceAttestation = RecordingDeviceAttestation::new();
 
 // ============================================================================
 // Device data model — copied from examples/src/bin/onoff_light.rs
@@ -160,6 +226,7 @@ macro_rules! commissioning_test {
         device_buffers: $dev_buffers:expr,
         device_subscriptions: $dev_subs:expr,
         ctrl_matter: $ctrl_matter:expr,
+        device_attestation: $dev_att:expr,
         use_tcp: $use_tcp:expr,
         device_transport: $dev_transport:expr,
         ctrl_transport: $ctrl_transport:expr $(,)?
@@ -179,7 +246,7 @@ macro_rules! commissioning_test {
             let device_matter = $dev_matter.uninit().init_with(Matter::init(
                 &TEST_DEV_DET,
                 TEST_DEV_COMM,
-                &TEST_DEV_ATT,
+                $dev_att,
                 MATTER_PORT,
             ));
 
@@ -251,7 +318,7 @@ macro_rules! commissioning_test {
 
             let controller_fut = run_with_transport(
                 ctrl_matter.run(&ctrl_crypto, &ctrl_net, &ctrl_net, NoNetwork),
-                run_controller_flow(ctrl_matter, &ctrl_crypto, $use_tcp),
+                run_controller_flow(ctrl_matter, device_matter, &ctrl_crypto, $use_tcp),
             );
 
             run_device_controller(device_fut, controller_fut).await
@@ -266,6 +333,7 @@ commissioning_test! {
     device_buffers: DEVICE_BUFFERS,
     device_subscriptions: DEVICE_STATE,
     ctrl_matter: CTRL_MATTER,
+    device_attestation: &UDP_DEV_ATT,
     use_tcp: false,
     device_transport: async_io::Async::<UdpSocket>::bind(MATTER_SOCKET_BIND_ADDR)?,
     ctrl_transport: create_dual_stack_socket()?,
@@ -278,6 +346,7 @@ commissioning_test! {
     device_buffers: TCP_DEVICE_BUFFERS,
     device_subscriptions: TCP_DEVICE_STATE,
     ctrl_matter: TCP_CTRL_MATTER,
+    device_attestation: &TEST_DEV_ATT,
     use_tcp: true,
     device_transport: TcpNetwork::<8>::new(
         async_io::Async::<TcpListener>::bind(MATTER_SOCKET_BIND_ADDR)?,
@@ -289,6 +358,7 @@ commissioning_test! {
 
 async fn run_controller_flow<C: Crypto>(
     matter: &Matter<'_>,
+    device_matter: &Matter<'_>,
     crypto: &C,
     use_tcp: bool,
 ) -> Result<(), Error> {
@@ -296,8 +366,8 @@ async fn run_controller_flow<C: Crypto>(
     let peer_addr = discover_and_resolve_device(use_tcp)?;
 
     info!("=== Phase 2: Commissioner — commission() (incl. PASE) + complete_via_case() ===");
-    let (controller_fab_idx, device_node_id) =
-        test_commission(matter, crypto, peer_addr, use_tcp).await?;
+    let (controller_fab_idx, device_fab_idx, device_node_id) =
+        test_commission(matter, device_matter, crypto, peer_addr, use_tcp).await?;
 
     // Cherry on top: after `CommissioningComplete` the device has
     // committed our fabric, torn down PASE, and the only authenticated
@@ -308,14 +378,36 @@ async fn run_controller_flow<C: Crypto>(
     info!("=== Phase 4: IM Operations over the CASE session ===");
     test_onoff_cluster(matter, controller_fab_idx, device_node_id).await?;
 
+    info!("=== Phase 5: authenticated RemoveFabric proof ===");
+    let proof = remove_fabric_via_case(
+        matter,
+        crypto,
+        controller_fab_idx,
+        device_node_id,
+        device_fab_idx,
+    )
+    .await?;
+    assert_eq!(proof.controller_fabric_index(), controller_fab_idx);
+    assert_eq!(proof.peer_node_id(), device_node_id);
+    assert_eq!(proof.removed_fabric_index(), device_fab_idx);
+    assert_ne!(proof.session_id(), 0);
+    assert_ne!(proof.local_session_id(), 0);
+    assert_ne!(proof.peer_session_id(), 0);
+    assert!(matter
+        .with_state(|state| state.fabrics.fabric(controller_fab_idx).map(|_| ()))
+        .is_ok());
+    assert!(device_matter
+        .with_state(|state| state.fabrics.fabric(device_fab_idx).map(|_| ()))
+        .is_err());
+
     info!("=== All commissioning test phases completed successfully! ===");
     Ok(())
 }
 
 /// Drive both phases of the commissioner flow against the peer that
 /// PASE was just negotiated with. Returns the
-/// `(controller_local_fab_idx, device_node_id)` needed to open
-/// post-commissioning CASE exchanges.
+/// `(controller_local_fab_idx, device_peer_fab_idx, device_node_id)` needed
+/// for post-commissioning CASE exchanges and targeted fabric removal.
 ///
 /// All of the "build a fabric for the controller" plumbing lives in
 /// this test, not the `commissioner` crate: generate RCAC + ICAC,
@@ -326,10 +418,11 @@ async fn run_controller_flow<C: Crypto>(
 /// [`Commissioner`].
 async fn test_commission<C: Crypto>(
     matter: &Matter<'_>,
+    device_matter: &Matter<'_>,
     crypto: &C,
     peer_addr: Address,
     use_tcp: bool,
-) -> Result<(core::num::NonZeroU8, u64), Error> {
+) -> Result<(core::num::NonZeroU8, core::num::NonZeroU8, u64), Error> {
     const FABRIC_ID: u64 = 1;
     // chip-tool's conventional admin NodeID; matches the
     // CaseAdminSubject the device-side ACL is seeded with.
@@ -420,22 +513,67 @@ async fn test_commission<C: Crypto>(
         TransportPreference::Mrp
     });
 
-    let opts = CommissionOptions {
-        // Test DAC — system_tests / TEST_DEV_ATT.
-        allow_test_attestation: true,
-        ..CommissionOptions::default()
-    };
+    let opts = CommissionOptions::default();
 
-    // Phase 1 — establishes PASE (lazily on first step) then ArmFailSafe → ... → AddNOC.
+    let mut rejected_nonce = None;
+    if !use_tcp {
+        let mut evidence_order = 0;
+        let err = commissioner
+            .commission_with_attestation(
+                peer_addr,
+                TEST_PASSCODE,
+                &opts,
+                DEVICE_NODE_ID,
+                VALID_FOREVER,
+                |evidence| {
+                    if let Some(nonce) =
+                        verify_test_evidence(crypto, evidence, &mut evidence_order)?
+                    {
+                        rejected_nonce = Some(nonce);
+                        Err(ErrorCode::InvalidData.into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::InvalidData);
+        assert_eq!(evidence_order, 3);
+        assert_eq!(UDP_DEV_ATT.calls(), (1, 1, 1, 1));
+        device_state_after_rejection(device_matter)?;
+        Exchange::initiate_pase(matter, crypto, peer_addr, TEST_PASSCODE)
+            .await?
+            .operational_credentials()
+            .trusted_root_certificates_read_with(ROOT_ENDPOINT_ID, |roots| {
+                assert!(roots?.iter().next().is_none());
+                Ok::<_, Error>(())
+            })
+            .await??;
+    }
+
+    // Phase 1 — establishes PASE (lazily on first step) then ArmFailSafe →
+    // attestation evidence callback → CSRRequest → AddTrustedRoot → AddNOC.
+    let mut evidence_order = 0;
     let result = commissioner
-        .commission(
+        .commission_with_attestation(
             peer_addr,
             TEST_PASSCODE,
             &opts,
             DEVICE_NODE_ID,
             VALID_FOREVER,
+            |evidence| {
+                if let Some(nonce) = verify_test_evidence(crypto, evidence, &mut evidence_order)? {
+                    if let Some(rejected_nonce) = rejected_nonce {
+                        assert_ne!(nonce, rejected_nonce);
+                    }
+                }
+                Ok(())
+            },
         )
         .await?;
+    assert_eq!(evidence_order, 3);
     info!(
         "commission() phase 1 ok: device_fabric_index={}, device_node_id=0x{:016x}",
         result.fabric_index, result.device_node_id,
@@ -461,17 +599,77 @@ async fn test_commission<C: Crypto>(
     // against.
     let mdns = stub_mdns_resolver_txt(matter, &mdns_table, if use_tcp { "6" } else { "" });
 
-    match select(pin!(commissioner.complete_via_case(&result)), pin!(mdns)).await {
+    let proof = match select(pin!(commissioner.complete_via_case(&result)), pin!(mdns)).await {
         Either::First(r) => r?,
         Either::Second(_) => unreachable!("the stub resolver never returns"),
-    }
+    };
+    assert_eq!(proof.controller_fabric_index(), controller_fab_idx);
+    assert_eq!(proof.commissioned_node_id(), result.device_node_id);
+    assert_ne!(proof.session_id(), 0);
+    assert_ne!(proof.local_session_id(), 0);
+    assert_ne!(proof.peer_session_id(), 0);
 
     info!(
         "complete_via_case() ok: controller_fab_idx={}, discovery+CASE+CommissioningComplete done",
         controller_fab_idx,
     );
 
-    Ok((controller_fab_idx, result.device_node_id))
+    Ok((
+        controller_fab_idx,
+        result.fabric_index,
+        result.device_node_id,
+    ))
+}
+
+fn verify_test_evidence<C: Crypto>(
+    crypto: &C,
+    evidence: AttestationEvidence<'_>,
+    order: &mut u8,
+) -> Result<Option<[u8; 32]>, Error> {
+    match evidence {
+        AttestationEvidence::Dac(dac) => {
+            assert_eq!(*order, 0);
+            assert_eq!(dac, TEST_DEV_ATT.dac());
+            *order += 1;
+            Ok(None)
+        }
+        AttestationEvidence::Pai(pai) => {
+            assert_eq!(*order, 1);
+            assert_eq!(pai, TEST_DEV_ATT.pai());
+            *order += 1;
+            Ok(None)
+        }
+        AttestationEvidence::Attestation {
+            elements,
+            signature,
+            nonce,
+            challenge,
+        } => {
+            assert_eq!(*order, 2);
+            let decoded = TLVElement::new(elements).structure()?;
+            assert_eq!(
+                OctetStr::from_tlv(&decoded.ctx(1)?)?.0,
+                TEST_DEV_ATT.cert_declaration()
+            );
+            assert_eq!(OctetStr::from_tlv(&decoded.ctx(2)?)?.0, nonce);
+
+            let mut signed = elements.to_vec();
+            signed.extend_from_slice(challenge);
+            assert!(crypto
+                .pub_key(TEST_DEV_ATT.dac_pub_key())?
+                .verify(&signed, CanonPkcSignatureRef::try_new(signature)?,)?);
+
+            *order += 1;
+            Ok(Some(*nonce))
+        }
+    }
+}
+
+fn device_state_after_rejection(device_matter: &Matter<'_>) -> Result<(), Error> {
+    device_matter.with_state(|state| {
+        assert_eq!(state.fabrics.iter().count(), 0);
+        Ok(())
+    })
 }
 
 // ============================================================================

@@ -238,6 +238,7 @@ impl AvahiMdns {
                             addrs: ips.iter().copied(),
                             txt: txt_pairs.iter().copied(),
                             scope_id,
+                            lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                         },
                         // The Avahi daemon owns the host A/AAAA records; this backend never
                         // sees the local interface addresses.
@@ -313,6 +314,7 @@ impl AvahiMdns {
                             addrs: ips.iter().copied(),
                             txt: txt_pairs.iter().copied(),
                             scope_id,
+                            lifetime: crate::transport::network::mdns::RecordLifetime::Unavailable,
                         });
                 }
             }
