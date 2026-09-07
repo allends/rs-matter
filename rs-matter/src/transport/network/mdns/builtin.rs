@@ -168,6 +168,92 @@ impl BuiltinMdns {
             .await
     }
 
+    /// Run only the mDNS resolver/querier, without publishing or answering for local services.
+    ///
+    /// This is intended for controllers that coexist with an OS mDNS responder or another Matter
+    /// implementation on UDP 5353. The caller still owns socket creation, multicast membership,
+    /// and cancellation. Unlike [`Self::run`], this method never inspects or advertises
+    /// [`MatterLocalService`] entries.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_resolver<S, R, C>(
+        &mut self,
+        send: S,
+        recv: R,
+        ipv4_interface: Option<Ipv4Addr>,
+        ipv6_interface: Option<u32>,
+        ipv6_addrs: &[crate::transport::network::Ipv6Addr],
+        matter: &Matter<'_>,
+        crypto: C,
+    ) -> Result<(), Error>
+    where
+        S: NetworkSend,
+        R: NetworkReceive,
+        C: Crypto,
+    {
+        let send = IfMutex::new((send, &mut self.services_new));
+
+        let mut receive = pin!(Self::receive_answers(
+            recv,
+            ipv6_interface,
+            ipv6_addrs,
+            matter
+        ));
+        let mut resolve = pin!(Self::resolve(
+            &send,
+            ipv4_interface,
+            ipv6_interface,
+            matter,
+            &crypto,
+        ));
+        let mut browse = pin!(Self::browse(
+            &send,
+            ipv4_interface,
+            ipv6_interface,
+            matter,
+            &crypto,
+        ));
+
+        embassy_futures::select::select3(&mut receive, &mut resolve, &mut browse)
+            .coalesce()
+            .await
+    }
+
+    async fn receive_answers<R>(
+        mut recv: R,
+        ipv6_interface: Option<u32>,
+        ipv6_addrs: &[crate::transport::network::Ipv6Addr],
+        matter: &Matter<'_>,
+    ) -> Result<(), Error>
+    where
+        R: NetworkReceive,
+    {
+        loop {
+            recv.wait_available().await?;
+            let rx_buf = matter.transport_rx_buffer();
+            let mut rx_buf = rx_buf.get().await.ok_or(ErrorCode::ResourceExhausted)?;
+            let (len, _) = recv.recv_from(&mut rx_buf).await?;
+            let packet = &rx_buf[..len];
+
+            if !matches!(
+                Message::from_octets(packet).map(|message| message.header().flags().qr),
+                Ok(true)
+            ) {
+                continue;
+            }
+
+            match parse_into_answer(packet, ipv6_interface) {
+                Ok(Some(answer)) => {
+                    matter
+                        .transport()
+                        .try_deposit_mdns_resolve(&answer, ipv6_addrs);
+                    matter.transport().try_deposit_mdns_browse(&answer);
+                }
+                Ok(None) => {}
+                Err(error) => debug!("Failed to parse mDNS response: {:?}", error),
+            }
+        }
+    }
+
     /// MdnsLocalService [`Matter::resolve`] requests: pick up a pending resolve request
     /// and emit the corresponding mDNS query on the shared socket.
     async fn resolve<S, C>(
