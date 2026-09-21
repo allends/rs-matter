@@ -54,6 +54,31 @@ use crate::crypto::{
 use crate::error::Error;
 use crate::tlv::TLVElement;
 
+/// Canonical positive ASN.1 INTEGER encoding retaining all 64 random bits.
+/// Zero maps to one because a certificate serial must be nonzero.
+struct CaSerial([u8; 9]);
+
+impl CaSerial {
+    fn new(bytes: [u8; 8]) -> Self {
+        let mut encoded = [0; 9];
+        encoded[1..].copy_from_slice(&bytes);
+        if bytes == [0; 8] {
+            encoded[8] = 1;
+        }
+        Self(encoded)
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        let first = self.0.iter().position(|byte| *byte != 0).unwrap();
+        let start = if self.0[first] & 0x80 != 0 {
+            first - 1
+        } else {
+            first
+        };
+        &self.0[start..]
+    }
+}
+
 pub struct RcacGenerator<'a> {
     buf: &'a mut [u8],
 }
@@ -103,7 +128,7 @@ impl<'a> RcacGenerator<'a> {
         let cert_len = CertGenerator::new(self.buf).generate(
             &crypto,
             CertType::Rcac,
-            &serial_bytes,
+            CaSerial::new(serial_bytes).as_bytes(),
             validity,
             SubjectDN {
                 node_id: None,
@@ -186,7 +211,7 @@ impl<'a> IcacGenerator<'a> {
         let cert_len = CertGenerator::new(self.buf).generate(
             &crypto,
             CertType::Icac,
-            &serial_bytes,
+            CaSerial::new(serial_bytes).as_bytes(),
             validity,
             SubjectDN {
                 node_id: None,
@@ -219,6 +244,33 @@ mod tests {
     use crate::tlv::TLVElement;
 
     use super::*;
+
+    #[test]
+    fn ca_serial_is_positive_minimal_and_nonzero() {
+        assert_eq!(CaSerial::new([0; 8]).as_bytes(), &[1]);
+        assert_eq!(
+            CaSerial::new([0, 0x18, 0, 0, 0, 0, 0, 1]).as_bytes(),
+            &[0x18, 0, 0, 0, 0, 0, 1]
+        );
+        assert_eq!(
+            CaSerial::new([0, 0x80, 0, 0, 0, 0, 0, 1]).as_bytes(),
+            &[0, 0x80, 0, 0, 0, 0, 0, 1]
+        );
+        assert_eq!(
+            CaSerial::new([0xff; 8]).as_bytes(),
+            &[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
+        );
+        for value in 1..=u16::MAX {
+            let serial = CaSerial::new(u64::from(value).to_be_bytes());
+            let bytes = serial.as_bytes();
+            assert_eq!(bytes[0] & 0x80, 0);
+            assert!(bytes.len() == 1 || bytes[0] != 0 || bytes[1] & 0x80 != 0);
+            assert_eq!(
+                bytes.iter().fold(0u64, |n, b| (n << 8) | u64::from(*b)),
+                u64::from(value)
+            );
+        }
+    }
 
     #[test]
     fn rcac_carries_supplied_fabric_id() {
