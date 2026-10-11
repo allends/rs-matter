@@ -56,6 +56,7 @@ use crate::persist::{KvBlobStoreAccess, NETWORKS_KEY};
 use crate::respond::ExchangeHandler;
 use crate::tlv::{get_root_node_struct, FromTLV, Nullable, TLVElement, TLVTag, TLVWrite, ToTLV};
 use crate::transport::exchange::{Exchange, ExchangeId, MAX_EXCHANGE_TX_BUF_SIZE};
+use crate::transport::session::SessionMode;
 use crate::utils::init::{init, Init};
 use crate::utils::select::Coalesce;
 use crate::utils::storage::pooled::Buffers;
@@ -72,6 +73,75 @@ pub mod events;
 pub mod expand;
 pub mod invoker;
 pub mod subscriptions;
+
+/// A borrowed report issued by the Interaction Model after CASE-only admission.
+///
+/// The identity comes from the actual receiving session, and response() borrows
+/// the parsed exchange RX payload. Neither application metadata nor a handwritten
+/// ReportContext can construct this witness. It certifies session provenance,
+/// not subscription ownership, exact attribute paths, or successful status delivery;
+/// the consumer must still validate its active subscription and report envelope.
+/// Use is_from() against the owned Matter runtime, not a separately supplied context.
+///
+/// ```compile_fail
+/// use rs_matter::im::CaseReport;
+/// use core::num::NonZeroU8;
+/// let report = CaseReport {
+///     response: todo!(),
+///     local_slot: NonZeroU8::new(1).unwrap(),
+///     node: 42,
+///     origin: 0,
+/// };
+/// ```
+pub struct CaseReport<'report, 'tlv> {
+    response: &'report ReportDataResp<'tlv>,
+    local_slot: NonZeroU8,
+    node: NodeId,
+    origin: usize,
+}
+
+impl<'report, 'tlv> CaseReport<'report, 'tlv> {
+    pub fn response(&self) -> &'report ReportDataResp<'tlv> {
+        self.response
+    }
+
+    pub fn local_slot(&self) -> NonZeroU8 {
+        self.local_slot
+    }
+
+    pub fn node(&self) -> NodeId {
+        self.node
+    }
+
+    /// Whether the actual receiving stack is this exact owned Matter instance.
+    /// No raw address, dereference or transferable runtime identity is exposed.
+    pub fn is_from(&self, matter: &Matter<'_>) -> bool {
+        report_origin_matches(self.origin, matter)
+    }
+}
+
+fn report_origin_matches(origin: usize, matter: &Matter<'_>) -> bool {
+    origin == matter as *const Matter<'_> as usize
+}
+
+/// Admit only a CASE session with its exact local fabric slot and a known,
+/// nonzero peer. A promoted PASE slot is not operational authentication.
+fn report_data_identity(
+    mode: &SessionMode,
+    local_fabric_idx: u8,
+    peer_node_id: Option<NodeId>,
+) -> Result<(NonZeroU8, NodeId), Error> {
+    let SessionMode::Case { fab_idx, .. } = mode else {
+        return Err(ErrorCode::Invalid.into());
+    };
+    if local_fabric_idx != fab_idx.get() {
+        return Err(ErrorCode::Invalid.into());
+    }
+    let node = peer_node_id
+        .filter(|node| *node != 0)
+        .ok_or(ErrorCode::Invalid)?;
+    Ok((*fab_idx, node))
+}
 
 /// Resource-utilisation metrics for the node, as reported by
 /// `GeneralDiagnostics::DeviceLoadStatus`.
@@ -1074,11 +1144,11 @@ where
         let (fabric_idx, peer_node_id) = exchange.with_state(|state| {
             let sess = exchange.id().session(&mut state.sessions);
 
-            let fabric_idx =
-                NonZeroU8::new(sess.get_local_fabric_idx()).ok_or(ErrorCode::Invalid)?;
-            let peer_node_id = sess.get_peer_node_id().ok_or(ErrorCode::Invalid)?;
-
-            Ok((fabric_idx, peer_node_id))
+            report_data_identity(
+                sess.get_session_mode(),
+                sess.get_local_fabric_idx(),
+                sess.get_peer_node_id(),
+            )
         })?;
 
         loop {
@@ -1098,7 +1168,16 @@ where
                 // mutable ack/fetch loop below.
                 let ctx = crate::dm::ReportContextInstance::new(&*exchange, self, subscription);
 
-                let result = self.report_handler.handle_report(ctx, &report).await;
+                let case_report = CaseReport {
+                    response: &report,
+                    local_slot: fabric_idx,
+                    node: peer_node_id,
+                    origin: self.matter as *const Matter<'_> as usize,
+                };
+                let result = self
+                    .report_handler
+                    .handle_case_report(ctx, case_report)
+                    .await;
 
                 (
                     result,
@@ -2579,5 +2658,60 @@ where
             .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod report_data_tests {
+    use super::*;
+    use crate::transport::session::SessionMode;
+
+    #[test]
+    fn report_data_origin_rejects_a_distinct_matter_owner() {
+        use crate::dm::devices::test::{TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET};
+        let owner = Matter::new(&TEST_DEV_DET, TEST_DEV_COMM, &TEST_DEV_ATT, 0);
+        let other = Matter::new(&TEST_DEV_DET, TEST_DEV_COMM, &TEST_DEV_ATT, 0);
+        // Pure identity policy only: no CaseReport or authenticated fixture is minted.
+        let origin = &owner as *const Matter<'_> as usize;
+        assert!(report_origin_matches(origin, &owner));
+        assert!(!report_origin_matches(origin, &other));
+    }
+
+    fn case() -> SessionMode {
+        SessionMode::Case {
+            fab_idx: NonZeroU8::new(1).unwrap(),
+            cat_ids: Default::default(),
+        }
+    }
+
+    #[test]
+    fn report_data_rejects_pase_even_with_a_promoted_fabric_slot() {
+        for fab_idx in [0, 1] {
+            assert!(
+                report_data_identity(&SessionMode::Pase { fab_idx }, fab_idx, Some(42)).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn report_data_accepts_only_matching_case_identity() {
+        assert_eq!(
+            report_data_identity(&case(), 1, Some(42)).unwrap(),
+            (NonZeroU8::new(1).unwrap(), 42)
+        );
+        assert!(report_data_identity(&case(), 0, Some(42)).is_err());
+        assert!(report_data_identity(&case(), 2, Some(42)).is_err());
+        assert!(report_data_identity(&case(), 1, None).is_err());
+        assert!(report_data_identity(&case(), 1, Some(0)).is_err());
+    }
+
+    #[test]
+    fn report_data_rejects_plaintext_and_group_identity() {
+        assert!(report_data_identity(&SessionMode::PlainText, 1, Some(42)).is_err());
+        let group = SessionMode::Group {
+            fab_idx: NonZeroU8::new(1).unwrap(),
+            group_id: 1,
+        };
+        assert!(report_data_identity(&group, 1, Some(42)).is_err());
     }
 }

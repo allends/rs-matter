@@ -1903,6 +1903,19 @@ mod asynch {
             ctx: impl ReportContext,
             report: &ReportDataResp<'_>,
         ) -> impl Future<Output = Result<(), IMStatusCode>>;
+
+        /// Consume an actual CASE-session report issued by the Interaction Model.
+        ///
+        /// The default preserves existing consumers. A consumer requiring sealed
+        /// provenance should override this method and reject handle_report calls;
+        /// ReportContext and parsed report metadata alone are publicly constructible.
+        fn handle_case_report(
+            &self,
+            ctx: impl ReportContext,
+            report: crate::im::CaseReport<'_, '_>,
+        ) -> impl Future<Output = Result<(), IMStatusCode>> {
+            self.handle_report(ctx, report.response())
+        }
     }
 
     impl<T> ReportDataHandler for &T
@@ -1916,6 +1929,14 @@ mod asynch {
         ) -> impl Future<Output = Result<(), IMStatusCode>> {
             (**self).handle_report(ctx, report)
         }
+
+        fn handle_case_report(
+            &self,
+            ctx: impl ReportContext,
+            report: crate::im::CaseReport<'_, '_>,
+        ) -> impl Future<Output = Result<(), IMStatusCode>> {
+            (**self).handle_case_report(ctx, report)
+        }
     }
 
     impl<T> ReportDataHandler for &mut T
@@ -1928,6 +1949,14 @@ mod asynch {
             report: &ReportDataResp<'_>,
         ) -> impl Future<Output = Result<(), IMStatusCode>> {
             (**self).handle_report(ctx, report)
+        }
+
+        fn handle_case_report(
+            &self,
+            ctx: impl ReportContext,
+            report: crate::im::CaseReport<'_, '_>,
+        ) -> impl Future<Output = Result<(), IMStatusCode>> {
+            (**self).handle_case_report(ctx, report)
         }
     }
 
