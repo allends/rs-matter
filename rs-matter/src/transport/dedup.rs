@@ -86,7 +86,17 @@ impl RxCtrState {
                 // The previous max_ctr is now the actual counter
                 self.ctr_bitmap <<= udiff;
                 self.insert(udiff - 1);
+            } else if !is_encrypted && !with_rollover {
+                // A plaintext gap does not prove that the skipped counters were received.
+                // At exactly one bitmap width, retain the previous max at the oldest bit;
+                // for a larger gap it is outside the window and no lower counter is seen.
+                self.ctr_bitmap = if udiff == MSG_RX_STATE_BITMAP_LEN {
+                    1 << (MSG_RX_STATE_BITMAP_LEN - 1)
+                } else {
+                    0
+                };
             } else {
+                // Preserve the encrypted/group replay-window policy.
                 self.ctr_bitmap = 0xffff;
             }
             true
@@ -94,7 +104,9 @@ impl RxCtrState {
             // This is the case where the peer possibly rebooted and chose a different
             // random counter
             self.max_ctr = msg_ctr;
-            self.ctr_bitmap = 0xffff;
+            // The new plaintext epoch has only seen its max, not preceding counters.
+            // Rollover mode retains its existing policy (groups are encrypted).
+            self.ctr_bitmap = if with_rollover { 0xffff } else { 0 };
             true
         } else {
             false
@@ -195,6 +207,80 @@ mod tests {
 
     fn assert_dup(b: bool) {
         assert!(!b);
+    }
+
+    #[test]
+    fn plaintext_first_ack_does_not_mark_delayed_sigma2_seen() {
+        let mut state = RxCtrState::new(0);
+        assert!(state.post_recv(1000, NOT_ENCRYPTED, false));
+        assert!(state.post_recv(998, NOT_ENCRYPTED, false));
+        assert!(!state.post_recv(998, NOT_ENCRYPTED, false));
+    }
+
+    #[test]
+    fn plaintext_exact_bitmap_width_retains_only_previous_max() {
+        let mut state = RxCtrState::new(1000);
+        assert!(state.post_recv(1016, NOT_ENCRYPTED, false));
+        assert!(!state.post_recv(1000, NOT_ENCRYPTED, false));
+        assert!(state.post_recv(1001, NOT_ENCRYPTED, false));
+        assert!(state.post_recv(1015, NOT_ENCRYPTED, false));
+        assert!(!state.post_recv(1001, NOT_ENCRYPTED, false));
+        assert!(!state.post_recv(1015, NOT_ENCRYPTED, false));
+        assert!(!state.post_recv(1016, NOT_ENCRYPTED, false));
+    }
+
+    #[test]
+    fn plaintext_larger_gap_and_small_shifts_preserve_actually_seen_values() {
+        let mut state = RxCtrState::new(1000);
+        assert!(state.post_recv(1017, NOT_ENCRYPTED, false));
+        assert!(state.post_recv(1001, NOT_ENCRYPTED, false)); // Oldest in-window slot.
+        assert!(state.post_recv(1015, NOT_ENCRYPTED, false));
+        assert!(state.post_recv(1018, NOT_ENCRYPTED, false));
+        assert!(!state.post_recv(1015, NOT_ENCRYPTED, false));
+        assert!(!state.post_recv(1017, NOT_ENCRYPTED, false));
+        assert!(state.post_recv(1016, NOT_ENCRYPTED, false));
+        assert!(!state.post_recv(1016, NOT_ENCRYPTED, false));
+    }
+
+    #[test]
+    fn plaintext_reboot_window_accepts_delayed_unseen_counter_once() {
+        let mut state = RxCtrState::new(20010);
+        assert!(state.post_recv(20011, NOT_ENCRYPTED, false));
+        assert!(state.post_recv(1000, NOT_ENCRYPTED, false));
+        assert!(state.post_recv(998, NOT_ENCRYPTED, false));
+        assert!(!state.post_recv(998, NOT_ENCRYPTED, false));
+        assert!(!state.post_recv(1000, NOT_ENCRYPTED, false));
+    }
+
+    #[test]
+    fn encrypted_gap_and_reboot_rejection_policy_is_unchanged() {
+        for gap in [16, 17, 1000] {
+            let mut state = RxCtrState::new(1000);
+            assert!(state.post_recv(1000 + gap, ENCRYPTED, false));
+            assert!(!state.post_recv(999 + gap, ENCRYPTED, false));
+            assert!(!state.post_recv(1000, ENCRYPTED, false));
+            assert!(!state.post_recv(998, ENCRYPTED, false));
+        }
+    }
+
+    #[test]
+    fn rollover_replay_policy_is_unchanged_even_for_plaintext_flag() {
+        for encrypted in [ENCRYPTED, NOT_ENCRYPTED] {
+            let mut state = RxCtrState::new(1000);
+            assert!(state.post_recv(1017, encrypted, true));
+            assert!(!state.post_recv(1015, encrypted, true));
+        }
+    }
+
+    #[cfg(feature = "groups")]
+    #[test]
+    fn group_store_large_gap_keeps_encrypted_replay_rejection() {
+        let mut store = super::GroupCtrStore::new();
+        assert!(store.post_recv(1, 0x1111, 1000));
+        assert!(store.post_recv(1, 0x1111, 1017));
+        assert!(!store.post_recv(1, 0x1111, 1015));
+        assert!(!store.post_recv(1, 0x1111, 1017));
+        assert!(store.post_recv(1, 0x2222, 1015)); // Different sender is independent.
     }
 
     #[test]
