@@ -134,6 +134,10 @@ pub struct Transport {
     /// The single in-flight mDNS resolve rendezvous, shared between [`Transport::resolve`]
     /// callers and the running mDNS responder.
     mdns_resolve: Signal<MdnsResolveState>,
+    /// One owner for cold operational establishment. Existing secure sessions bypass this gate.
+    /// The guard spans resolve and CASE, so a queued caller reuses the session published by
+    /// the owner instead of issuing another resolve while the owner is still establishing.
+    cold_case: IfMutex<()>,
     /// The single in-flight mDNS commissionable-browse rendezvous, shared between
     /// [`Transport::browse_commissionable`] callers and the running mDNS responder.
     mdns_browse: Signal<MdnsBrowseState>,
@@ -172,6 +176,7 @@ impl Transport {
             exchange_dropped: Notification::new(),
             mdns_changed: Notification::new(),
             mdns_resolve: Signal::new(MdnsResolveState::Idle),
+            cold_case: IfMutex::new(()),
             mdns_browse: Signal::new(MdnsBrowseState::Idle),
             session_removed: Notification::new(),
             groups_modified: Notification::new(),
@@ -191,6 +196,7 @@ impl Transport {
             exchange_dropped <- Notification::init(),
             mdns_changed <- Notification::init(),
             mdns_resolve <- Signal::init(MdnsResolveState::Idle),
+            cold_case <- IfMutex::init(()),
             mdns_browse <- Signal::init(MdnsBrowseState::Idle),
             session_removed <- Notification::init(),
             groups_modified <- Notification::init(),
@@ -841,6 +847,23 @@ impl Transport {
     /// Single-shot for now (no backoff re-query); see follow-ups.
     const RESOLVE_TIMEOUT_MS: u32 = 5_000;
 
+    /// Claim cold establishment only if no usable session exists, rechecking after waiting.
+    /// Lookup is supplied by the actual session table; this gate neither publishes sessions nor
+    /// authenticates peers. Returning the guard keeps resolve/CASE cancellation RAII-safe.
+    async fn claim_cold_case(
+        &self,
+        mut existing: impl FnMut() -> Result<Option<u32>, Error>,
+    ) -> Result<(Option<IfMutexGuard<'_, ()>>, Option<u32>), Error> {
+        if let Some(id) = existing()? {
+            return Ok((None, Some(id)));
+        }
+        let guard = self.cold_case.lock().await;
+        if let Some(id) = existing()? {
+            return Ok((None, Some(id)));
+        }
+        Ok((Some(guard), None))
+    }
+
     /// Open an exchange over a CASE session to an already-commissioned node.
     ///
     /// If a CASE session for `(fabric_idx, peer_node_id)` already exists, an
@@ -858,15 +881,18 @@ impl Transport {
         peer_node_id: NodeId,
         transport: TransportPreference,
     ) -> Result<Exchange<'a>, Error> {
-        // Reuse an existing CASE session if present.
-        let existing = matter.with_state(|state| {
-            Ok::<_, Error>(
-                state
-                    .sessions
-                    .get_for_node(fabric_idx, peer_node_id)
-                    .map(|s| s.id),
-            )
-        })?;
+        // The fast path bypasses the cold gate; queued cold callers recheck after its owner
+        // finishes. Keep the guard until resolve, CASE, and session-param seeding all complete.
+        let (_cold_guard, existing) = self
+            .claim_cold_case(|| {
+                matter.with_state(|state| {
+                    Ok(state
+                        .sessions
+                        .get_for_node(fabric_idx, peer_node_id)
+                        .map(|s| s.id))
+                })
+            })
+            .await?;
 
         if let Some(session_id) = existing {
             return self.initiate_for_session(matter, crypto, session_id);
@@ -3310,5 +3336,106 @@ mod browse_tests {
                 0x2222,
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod cold_case_tests {
+    use crate::error::ErrorCode;
+    use core::{
+        cell::Cell,
+        future::Future,
+        pin::pin,
+        task::{Context, Poll},
+    };
+    use std::sync::Arc;
+    use std::task::Wake;
+    struct Noop;
+    impl Wake for Noop {
+        fn wake(self: Arc<Self>) {}
+    }
+    fn poll<F: Future>(future: core::pin::Pin<&mut F>) -> Poll<F::Output> {
+        let waker = Arc::new(Noop).into();
+        future.poll(&mut Context::from_waker(&waker))
+    }
+    // These exercise production arbitration only. Lookup IDs are test state, not CASE proofs.
+    #[test]
+    fn cold_case_duplicate_caller_rechecks_after_owner_finishes() {
+        let matter = crate::test::test_matter();
+        let transport = matter.transport();
+        let published = Cell::new(None);
+        let lookup = || Ok(published.get());
+        let mut first = pin!(transport.claim_cold_case(lookup));
+        let Poll::Ready(Ok((owner, None))) = poll(first.as_mut()) else {
+            panic!("cold owner");
+        };
+        let mut second = pin!(transport.claim_cold_case(lookup));
+        assert!(poll(second.as_mut()).is_pending());
+        published.set(Some(42));
+        drop(owner);
+        let Poll::Ready(Ok((guard, existing))) = poll(second.as_mut()) else {
+            panic!("reuse");
+        };
+        assert!(guard.is_none());
+        assert_eq!(existing, Some(42));
+    }
+    #[test]
+    fn cold_case_cancelled_owner_releases_waiter() {
+        let matter = crate::test::test_matter();
+        let transport = matter.transport();
+        let mut first = Box::pin(async {
+            let (owner, existing) = transport.claim_cold_case(|| Ok(None)).await.unwrap();
+            assert!(existing.is_none());
+            core::future::pending::<()>().await;
+            drop(owner);
+        });
+        assert!(poll(first.as_mut()).is_pending());
+        let mut second = pin!(transport.claim_cold_case(|| Ok(None)));
+        assert!(poll(second.as_mut()).is_pending());
+        // Dropping the in-flight owner, not an explicit unlock, permits the next caller.
+        drop(first);
+        let Poll::Ready(Ok((next, None))) = poll(second.as_mut()) else {
+            panic!("next owner");
+        };
+        assert!(next.is_some());
+    }
+    #[test]
+    fn cold_case_existing_session_bypasses_busy_cold_owner() {
+        let matter = crate::test::test_matter();
+        let transport = matter.transport();
+        let mut first = pin!(transport.claim_cold_case(|| Ok(None)));
+        let Poll::Ready(Ok((owner, None))) = poll(first.as_mut()) else {
+            panic!("owner");
+        };
+        let mut existing = pin!(transport.claim_cold_case(|| Ok(Some(7))));
+        let Poll::Ready(Ok((guard, id))) = poll(existing.as_mut()) else {
+            panic!("fast reuse");
+        };
+        assert!(guard.is_none());
+        assert_eq!(id, Some(7));
+        drop(owner);
+    }
+    #[test]
+    fn cold_case_lookup_error_releases_acquired_gate() {
+        let matter = crate::test::test_matter();
+        let transport = matter.transport();
+        let calls = Cell::new(0);
+        let mut failing = pin!(transport.claim_cold_case(|| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Ok(None)
+            } else {
+                Err(ErrorCode::InvalidState.into())
+            }
+        }));
+        assert!(
+            matches!(poll(failing.as_mut()), Poll::Ready(Err(error)) if error.code() == ErrorCode::InvalidState)
+        );
+        assert_eq!(calls.get(), 2);
+        let mut next = pin!(transport.claim_cold_case(|| Ok(None)));
+        let Poll::Ready(Ok((guard, None))) = poll(next.as_mut()) else {
+            panic!("released gate");
+        };
+        assert!(guard.is_some());
     }
 }
