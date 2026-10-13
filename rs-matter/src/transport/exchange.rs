@@ -96,7 +96,11 @@ impl ExchangeId {
         Self(((exchange_index as u32) << 28) | session_id)
     }
 
-    pub(crate) fn session_id(&self) -> u32 {
+    /// The local transport session identifier retained by this allocated exchange.
+    /// This is not a peer-assigned session identifier or authenticated session authority.
+    /// It can be passed to `Exchange::initiate_for_session` to reserve another exchange
+    /// on this exact session; allocation and session liveness remain checked there.
+    pub const fn session_id(&self) -> u32 {
         self.0 & 0x0fff_ffff
     }
 
