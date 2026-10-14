@@ -25,6 +25,7 @@
 //! incoming IM requests.
 
 use core::cell::Cell;
+use core::future::Future;
 use core::num::NonZeroU8;
 
 use crate::utils::sync::blocking::Mutex;
@@ -44,7 +45,9 @@ use crate::dm::networks::wireless::{NoopWirelessNetCtl, WirelessMgr, MAX_CREDS_S
 use crate::dm::networks::NetChangeNotif;
 use crate::dm::{
     AsyncHandler, AttrChangeNotifier, AttrDetails, Attribute, DataModel, EventEmitter,
-    HandlerContext, LifecycleOp, MatchContextInstance, Metadata, ReportDataHandler,
+    HandlerContext, LifecycleOp, MatchContextInstance, Metadata, ReportDataExchange,
+    ReportDataHandler, ReportDataVisitor, ReportExchangeComplete, ReportExchangeOutcome,
+    SealedReportDataExchange,
 };
 use crate::error::{Error, ErrorCode};
 use crate::im::events::{EventReader, EventTLVWrite, Events, DEFAULT_MAX_EVENTS_BUF_SIZE};
@@ -117,6 +120,626 @@ impl<'report, 'tlv> CaseReport<'report, 'tlv> {
     /// No raw address, dereference or transferable runtime identity is exposed.
     pub fn is_from(&self, matter: &Matter<'_>) -> bool {
         report_origin_matches(self.origin, matter)
+    }
+}
+
+struct InboundReportExchange<'e, 'x, 'a, C, B, T, K, N, NC, R, const NS: usize, const NE: usize>
+where
+    B: Buffers<IMBuffer>,
+{
+    exchange: &'e mut Exchange<'x>,
+    model: &'e InteractionModel<'a, C, B, T, K, N, NC, R, NS, NE>,
+    fabric_idx: NonZeroU8,
+    peer_node_id: NodeId,
+}
+
+struct ReportExchangeRx<'a> {
+    meta: crate::transport::exchange::MessageMeta,
+    payload: &'a [u8],
+}
+
+trait ReportExchangeIo<V> {
+    fn current(&self) -> Result<ReportExchangeRx<'_>, Error>;
+
+    fn visit<'a, 'p>(
+        &'a self,
+        visitor: &'a mut V,
+        report: &'a ReportDataResp<'p>,
+    ) -> impl Future<Output = Result<(), IMStatusCode>> + 'a;
+
+    fn send_status(&mut self, status: IMStatusCode) -> impl Future<Output = Result<(), Error>>;
+
+    fn fetch_next(&mut self) -> impl Future<Output = Result<(), Error>>;
+
+    fn acknowledge_terminal(&mut self) -> impl Future<Output = Result<(), Error>>;
+}
+
+async fn drive_report_exchange<I, V>(
+    io: &mut I,
+    mut visitor: V,
+) -> Result<ReportExchangeOutcome<V>, Error>
+where
+    I: ReportExchangeIo<V>,
+{
+    loop {
+        let chunk = {
+            let rx = io.current()?;
+            if rx.meta.proto_id != PROTO_ID_INTERACTION_MODEL {
+                return Err(ErrorCode::InvalidProto.into());
+            }
+            if rx.meta.opcode::<OpCode>()? != OpCode::ReportData {
+                return Err(ErrorCode::InvalidOpcode.into());
+            }
+
+            let report = ReportDataResp::from_tlv(&TLVElement::new(rx.payload))?;
+            let more_chunks = report.more_chunks.unwrap_or(false);
+            let suppress_response = report.suppress_response.unwrap_or(false);
+
+            if more_chunks && suppress_response {
+                None
+            } else {
+                let result = io.visit(&mut visitor, &report).await;
+                Some((result, more_chunks, suppress_response))
+            }
+        };
+
+        let Some((result, more_chunks, suppress_response)) = chunk else {
+            io.send_status(IMStatusCode::InvalidAction).await?;
+            return Ok(ReportExchangeOutcome::Rejected);
+        };
+
+        if let Err(status) = result {
+            io.send_status(status).await?;
+            return Ok(ReportExchangeOutcome::Rejected);
+        }
+
+        if !suppress_response {
+            io.send_status(IMStatusCode::Success).await?;
+        }
+
+        if !more_chunks {
+            // This is deliberately inside the consuming driver. On a legal
+            // suppressed terminal report there is no StatusResponse to carry
+            // the MRP acknowledgement, and even the idempotent path can fail
+            // if the session/exchange disappeared. No completion proof exists
+            // until that final local operation succeeds.
+            io.acknowledge_terminal().await?;
+
+            return Ok(ReportExchangeOutcome::Complete(
+                ReportExchangeComplete::new(visitor),
+            ));
+        }
+
+        io.fetch_next().await?;
+    }
+}
+
+impl<C, B, T, K, N, NC, R, const NS: usize, const NE: usize> SealedReportDataExchange
+    for InboundReportExchange<'_, '_, '_, C, B, T, K, N, NC, R, NS, NE>
+where
+    B: Buffers<IMBuffer>,
+{
+}
+
+impl<C, B, T, K, N, NC, R, const NS: usize, const NE: usize> ReportDataExchange
+    for InboundReportExchange<'_, '_, '_, C, B, T, K, N, NC, R, NS, NE>
+where
+    C: Crypto,
+    B: Buffers<IMBuffer>,
+    T: DataModel,
+    K: KvBlobStoreAccess,
+    N: Networks,
+    R: ReportDataHandler,
+{
+    async fn consume<V>(self, visitor: V) -> Result<ReportExchangeOutcome<V>, Error>
+    where
+        V: ReportDataVisitor,
+    {
+        let mut exchange = self;
+        drive_report_exchange(&mut exchange, visitor).await
+    }
+}
+
+impl<C, B, T, K, N, NC, R, V, const NS: usize, const NE: usize> ReportExchangeIo<V>
+    for InboundReportExchange<'_, '_, '_, C, B, T, K, N, NC, R, NS, NE>
+where
+    C: Crypto,
+    B: Buffers<IMBuffer>,
+    T: DataModel,
+    K: KvBlobStoreAccess,
+    N: Networks,
+    R: ReportDataHandler,
+    V: ReportDataVisitor,
+{
+    fn current(&self) -> Result<ReportExchangeRx<'_>, Error> {
+        let rx = self.exchange.rx()?;
+        Ok(ReportExchangeRx {
+            meta: rx.meta(),
+            payload: rx.payload(),
+        })
+    }
+
+    async fn visit<'a, 'p>(
+        &'a self,
+        visitor: &'a mut V,
+        report: &'a ReportDataResp<'p>,
+    ) -> Result<(), IMStatusCode> {
+        let subscription = crate::dm::SubscriptionCtx {
+            fabric_idx: self.fabric_idx,
+            peer_node_id: self.peer_node_id,
+            subscription_id: report.subscription_id,
+        };
+        let ctx = crate::dm::ReportContextInstance::new(&*self.exchange, self.model, subscription);
+        let report = CaseReport {
+            response: report,
+            local_slot: self.fabric_idx,
+            node: self.peer_node_id,
+            origin: self.model.matter as *const Matter<'_> as usize,
+        };
+
+        visitor.handle_case_report(ctx, report).await
+    }
+
+    async fn send_status(&mut self, status: IMStatusCode) -> Result<(), Error> {
+        InteractionModel::<C, B, T, K, N, NC, R, NS, NE>::send_status(self.exchange, status).await
+    }
+
+    async fn fetch_next(&mut self) -> Result<(), Error> {
+        self.exchange.recv_fetch().await?;
+        Ok(())
+    }
+
+    async fn acknowledge_terminal(&mut self) -> Result<(), Error> {
+        self.exchange.acknowledge().await
+    }
+}
+
+#[cfg(test)]
+mod report_exchange_lifecycle_tests {
+    use super::*;
+    use core::pin::Pin;
+    use core::task::{Context, Poll};
+    use futures_lite::future::block_on;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::task::Wake;
+    use std::vec::Vec;
+
+    struct Chunk {
+        meta: crate::transport::exchange::MessageMeta,
+        payload: Vec<u8>,
+    }
+
+    impl Chunk {
+        fn report(more_chunks: bool, suppress_response: bool) -> Self {
+            let mut storage = [0; 64];
+            let mut wb = WriteBuf::new(&mut storage);
+            ReportDataResp {
+                subscription_id: Some(7),
+                attr_reports: None,
+                event_reports: None,
+                more_chunks: Some(more_chunks),
+                suppress_response: Some(suppress_response),
+                interaction_model_revision: Some(IM_REVISION),
+            }
+            .to_tlv(&TLVTag::Anonymous, &mut wb)
+            .unwrap();
+
+            Self {
+                meta: OpCode::ReportData.into(),
+                payload: wb.as_slice().to_vec(),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Observation {
+        calls: Cell<usize>,
+        dropped_staged: Cell<usize>,
+        published: Cell<bool>,
+    }
+
+    struct StagedVisitor {
+        observation: Rc<Observation>,
+        calls: usize,
+        reject: Option<IMStatusCode>,
+        staged: bool,
+    }
+
+    impl StagedVisitor {
+        fn accepting(observation: Rc<Observation>) -> Self {
+            Self {
+                observation,
+                calls: 0,
+                reject: None,
+                staged: false,
+            }
+        }
+    }
+
+    impl Drop for StagedVisitor {
+        fn drop(&mut self) {
+            if self.staged && !self.observation.published.get() {
+                self.observation
+                    .dropped_staged
+                    .set(self.observation.dropped_staged.get() + 1);
+            }
+        }
+    }
+
+    struct ScriptIo {
+        chunks: Vec<Chunk>,
+        index: usize,
+        statuses: Vec<IMStatusCode>,
+        send_fails: bool,
+        fetch_fails: bool,
+        fetch_pending: bool,
+        terminal_ack_fails: bool,
+        terminal_ack_calls: usize,
+    }
+
+    impl ScriptIo {
+        fn new(chunks: Vec<Chunk>) -> Self {
+            Self {
+                chunks,
+                index: 0,
+                statuses: Vec::new(),
+                send_fails: false,
+                fetch_fails: false,
+                fetch_pending: false,
+                terminal_ack_fails: false,
+                terminal_ack_calls: 0,
+            }
+        }
+    }
+
+    impl ReportExchangeIo<StagedVisitor> for ScriptIo {
+        fn current(&self) -> Result<ReportExchangeRx<'_>, Error> {
+            let chunk = self.chunks.get(self.index).ok_or(ErrorCode::RxTimeout)?;
+            Ok(ReportExchangeRx {
+                meta: chunk.meta,
+                payload: &chunk.payload,
+            })
+        }
+
+        async fn visit<'a, 'p>(
+            &'a self,
+            visitor: &'a mut StagedVisitor,
+            report: &'a ReportDataResp<'p>,
+        ) -> Result<(), IMStatusCode> {
+            assert_eq!(report.subscription_id, Some(7));
+            visitor.calls += 1;
+            visitor
+                .observation
+                .calls
+                .set(visitor.observation.calls.get() + 1);
+            visitor.staged = true;
+            visitor.reject.map_or(Ok(()), Err)
+        }
+
+        async fn send_status(&mut self, status: IMStatusCode) -> Result<(), Error> {
+            self.statuses.push(status);
+            if self.send_fails {
+                Err(ErrorCode::NoSession.into())
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn fetch_next(&mut self) -> Result<(), Error> {
+            if self.fetch_fails {
+                return Err(ErrorCode::RxTimeout.into());
+            }
+            if self.fetch_pending {
+                core::future::pending::<()>().await;
+            }
+            self.index += 1;
+            Ok(())
+        }
+
+        async fn acknowledge_terminal(&mut self) -> Result<(), Error> {
+            self.terminal_ack_calls += 1;
+            if self.terminal_ack_fails {
+                Err(ErrorCode::NoSession.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn new_visitor() -> (StagedVisitor, Rc<Observation>) {
+        let observation = Rc::new(Observation::default());
+        (StagedVisitor::accepting(observation.clone()), observation)
+    }
+
+    #[test]
+    fn report_exchange_lifecycle_terminal_ack_failure_has_no_completion() {
+        let (visitor, observation) = new_visitor();
+        let mut io = ScriptIo::new(vec![Chunk::report(false, true)]);
+        io.terminal_ack_fails = true;
+
+        let error = block_on(drive_report_exchange(&mut io, visitor))
+            .err()
+            .unwrap();
+
+        assert_eq!(error.code(), ErrorCode::NoSession);
+        assert_eq!(io.terminal_ack_calls, 1);
+        assert!(io.statuses.is_empty());
+        assert_eq!(observation.dropped_staged.get(), 1);
+        assert!(!observation.published.get());
+    }
+
+    #[test]
+    fn report_exchange_lifecycle_forbidden_flags_skip_callback_and_reject() {
+        let (visitor, observation) = new_visitor();
+        let mut io = ScriptIo::new(vec![Chunk::report(true, true)]);
+
+        let outcome = block_on(drive_report_exchange(&mut io, visitor)).unwrap();
+
+        assert!(matches!(outcome, ReportExchangeOutcome::Rejected));
+        assert_eq!(observation.calls.get(), 0);
+        assert_eq!(io.statuses, vec![IMStatusCode::InvalidAction]);
+        assert_eq!(io.terminal_ack_calls, 0);
+    }
+
+    #[test]
+    fn report_exchange_lifecycle_wrong_opcode_skips_callback() {
+        let (visitor, observation) = new_visitor();
+        let mut chunk = Chunk::report(false, false);
+        chunk.meta = OpCode::StatusResponse.into();
+        let mut io = ScriptIo::new(vec![chunk]);
+
+        let error = block_on(drive_report_exchange(&mut io, visitor))
+            .err()
+            .unwrap();
+
+        assert_eq!(error.code(), ErrorCode::InvalidOpcode);
+        assert_eq!(observation.calls.get(), 0);
+        assert!(io.statuses.is_empty());
+        assert_eq!(io.terminal_ack_calls, 0);
+    }
+
+    #[test]
+    fn report_exchange_lifecycle_rejection_ignores_suppression() {
+        let (mut visitor, _) = new_visitor();
+        visitor.reject = Some(IMStatusCode::InvalidSubscription);
+        let mut io = ScriptIo::new(vec![Chunk::report(false, true)]);
+
+        let outcome = block_on(drive_report_exchange(&mut io, visitor)).unwrap();
+
+        assert!(matches!(outcome, ReportExchangeOutcome::Rejected));
+        assert_eq!(io.statuses, vec![IMStatusCode::InvalidSubscription]);
+        assert_eq!(io.terminal_ack_calls, 0);
+    }
+
+    #[test]
+    fn report_exchange_lifecycle_send_and_fetch_failures_have_no_completion() {
+        let (visitor, _) = new_visitor();
+        let mut send = ScriptIo::new(vec![Chunk::report(false, false)]);
+        send.send_fails = true;
+        assert_eq!(
+            block_on(drive_report_exchange(&mut send, visitor))
+                .err()
+                .unwrap()
+                .code(),
+            ErrorCode::NoSession
+        );
+        assert_eq!(send.terminal_ack_calls, 0);
+
+        let (visitor, _) = new_visitor();
+        let mut fetch = ScriptIo::new(vec![Chunk::report(true, false)]);
+        fetch.fetch_fails = true;
+        assert_eq!(
+            block_on(drive_report_exchange(&mut fetch, visitor))
+                .err()
+                .unwrap()
+                .code(),
+            ErrorCode::RxTimeout
+        );
+        assert_eq!(fetch.statuses, vec![IMStatusCode::Success]);
+        assert_eq!(fetch.terminal_ack_calls, 0);
+    }
+
+    #[test]
+    fn report_exchange_lifecycle_completion_follows_terminal_ack() {
+        for suppress in [false, true] {
+            let (visitor, observation) = new_visitor();
+            let mut io = ScriptIo::new(vec![Chunk::report(false, suppress)]);
+
+            let outcome = block_on(drive_report_exchange(&mut io, visitor)).unwrap();
+            let ReportExchangeOutcome::Complete(complete) = outcome else {
+                panic!("expected completion");
+            };
+            let (visitor, _terminal) = complete.into_parts();
+            observation.published.set(true);
+            assert_eq!(visitor.calls, 1);
+            assert_eq!(io.terminal_ack_calls, 1);
+            assert_eq!(
+                io.statuses,
+                if suppress {
+                    vec![]
+                } else {
+                    vec![IMStatusCode::Success]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn report_exchange_lifecycle_multichunk_success_preserves_staging_until_terminal() {
+        for suppress in [false, true] {
+            let (visitor, observation) = new_visitor();
+            let mut io = ScriptIo::new(vec![
+                Chunk::report(true, false),
+                Chunk::report(true, false),
+                Chunk::report(false, suppress),
+            ]);
+            let outcome = block_on(drive_report_exchange(&mut io, visitor)).unwrap();
+            let ReportExchangeOutcome::Complete(complete) = outcome else {
+                panic!("expected completion");
+            };
+            assert!(!observation.published.get());
+            assert_eq!(observation.dropped_staged.get(), 0);
+            assert_eq!(observation.calls.get(), 3);
+            assert_eq!(io.index, 2);
+            assert_eq!(io.terminal_ack_calls, 1);
+            assert_eq!(
+                io.statuses,
+                vec![IMStatusCode::Success; if suppress { 2 } else { 3 }]
+            );
+            let (visitor, _terminal) = complete.into_parts();
+            assert_eq!(visitor.calls, 3);
+            observation.published.set(true);
+            drop(visitor);
+            assert_eq!(observation.dropped_staged.get(), 0);
+        }
+    }
+
+    #[test]
+    fn report_exchange_lifecycle_malformed_continuation_drops_staging() {
+        let (visitor, observation) = new_visitor();
+        let mut malformed = Chunk::report(false, false);
+        malformed.payload.clear();
+        let mut io = ScriptIo::new(vec![Chunk::report(true, false), malformed]);
+        assert!(block_on(drive_report_exchange(&mut io, visitor)).is_err());
+        assert_eq!(observation.calls.get(), 1);
+        assert_eq!(observation.dropped_staged.get(), 1);
+        assert!(!observation.published.get());
+        assert_eq!(io.statuses, vec![IMStatusCode::Success]);
+        assert_eq!(io.terminal_ack_calls, 0);
+    }
+
+    #[test]
+    fn report_exchange_lifecycle_invalid_protocol_skips_callback() {
+        let (visitor, observation) = new_visitor();
+        let mut chunk = Chunk::report(false, false);
+        chunk.meta.proto_id = PROTO_ID_INTERACTION_MODEL + 1;
+        let mut io = ScriptIo::new(vec![chunk]);
+        assert_eq!(
+            block_on(drive_report_exchange(&mut io, visitor))
+                .err()
+                .unwrap()
+                .code(),
+            ErrorCode::InvalidProto
+        );
+        assert_eq!(observation.calls.get(), 0);
+        assert_eq!(io.terminal_ack_calls, 0);
+        assert!(io.statuses.is_empty());
+    }
+
+    // Sealed test-only driver fails before any callback or CASE proof can be
+    // issued. It exercises the real consuming loop through handler defaults
+    // and forwarding, without manufacturing authenticated context.
+    struct UnavailableExchange(Rc<Cell<usize>>);
+    impl SealedReportDataExchange for UnavailableExchange {}
+    impl ReportDataExchange for UnavailableExchange {
+        async fn consume<V>(self, visitor: V) -> Result<ReportExchangeOutcome<V>, Error>
+        where
+            V: ReportDataVisitor,
+        {
+            self.0.set(self.0.get() + 1);
+            drive_report_exchange(&mut UnavailableIo, visitor).await
+        }
+    }
+    struct UnavailableIo;
+    impl<V> ReportExchangeIo<V> for UnavailableIo {
+        fn current(&self) -> Result<ReportExchangeRx<'_>, Error> {
+            Err(ErrorCode::NoSession.into())
+        }
+        async fn visit<'a, 'p>(
+            &'a self,
+            _visitor: &'a mut V,
+            _report: &'a ReportDataResp<'p>,
+        ) -> Result<(), IMStatusCode> {
+            panic!("unavailable exchange must not visit");
+        }
+        async fn send_status(&mut self, _status: IMStatusCode) -> Result<(), Error> {
+            panic!("unavailable exchange must not send");
+        }
+        async fn fetch_next(&mut self) -> Result<(), Error> {
+            panic!("unavailable exchange must not fetch");
+        }
+        async fn acknowledge_terminal(&mut self) -> Result<(), Error> {
+            panic!("unavailable exchange must not acknowledge");
+        }
+    }
+    struct DefaultHandler;
+    impl ReportDataHandler for DefaultHandler {
+        async fn handle_report(
+            &self,
+            _ctx: impl crate::dm::ReportContext,
+            _report: &ReportDataResp<'_>,
+        ) -> Result<(), IMStatusCode> {
+            panic!("unavailable exchange must not invoke legacy callback");
+        }
+    }
+    struct OverrideHandler(Cell<usize>);
+    impl ReportDataHandler for OverrideHandler {
+        async fn handle_report(
+            &self,
+            _ctx: impl crate::dm::ReportContext,
+            _report: &ReportDataResp<'_>,
+        ) -> Result<(), IMStatusCode> {
+            panic!("unavailable exchange must not invoke legacy callback");
+        }
+        async fn handle_report_exchange(
+            &self,
+            exchange: impl ReportDataExchange,
+        ) -> Result<(), Error> {
+            self.0.set(self.0.get() + 1);
+            let _ = exchange.consume(self).await?;
+            Ok(())
+        }
+    }
+    fn check_hook<H: ReportDataHandler>(handler: H, consumes: &Rc<Cell<usize>>) {
+        let before = consumes.get();
+        let error = block_on(handler.handle_report_exchange(UnavailableExchange(consumes.clone())))
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::NoSession);
+        assert_eq!(consumes.get(), before + 1);
+    }
+    #[test]
+    fn report_exchange_lifecycle_default_and_reference_override_forwarding() {
+        let consumes = Rc::new(Cell::new(0));
+        let mut default = DefaultHandler;
+        check_hook(&default, &consumes);
+        check_hook(&mut default, &consumes);
+        check_hook(default, &consumes);
+        let mut overridden = OverrideHandler(Cell::new(0));
+        check_hook(&overridden, &consumes);
+        assert_eq!(overridden.0.get(), 1);
+        check_hook(&mut overridden, &consumes);
+        assert_eq!(overridden.0.get(), 2);
+        check_hook(&overridden, &consumes);
+        assert_eq!(overridden.0.get(), 3);
+        assert_eq!(consumes.get(), 6);
+    }
+
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+        let waker = Arc::new(NoopWake).into();
+        future.poll(&mut Context::from_waker(&waker))
+    }
+
+    #[test]
+    fn report_exchange_lifecycle_cancel_drops_staged_state_without_publish() {
+        let (visitor, observation) = new_visitor();
+        let mut io = ScriptIo::new(vec![Chunk::report(true, false)]);
+        io.fetch_pending = true;
+        let mut future = Box::pin(drive_report_exchange(&mut io, visitor));
+
+        assert!(poll_once(future.as_mut()).is_pending());
+        drop(future);
+
+        assert_eq!(observation.dropped_staged.get(), 1);
+        assert!(!observation.published.get());
+        assert_eq!(io.statuses, vec![IMStatusCode::Success]);
+        assert_eq!(io.terminal_ack_calls, 0);
     }
 }
 
@@ -844,7 +1467,10 @@ where
             OpCode::ReportData if is_groupcast => {
                 error!("Received a groupcast message for opcode: ReportData")
             }
-            OpCode::ReportData if !is_groupcast => self.handle_report_data(exchange).await?,
+            // ReportData owns its terminal acknowledgement inside the consuming
+            // exchange driver. Returning here avoids a second fallible outer
+            // acknowledgement after a completion proof has been handed out.
+            OpCode::ReportData if !is_groupcast => return self.handle_report_data(exchange).await,
             OpCode::TimedRequest if !is_groupcast => {
                 Self::send_status(exchange, IMStatusCode::InvalidAction).await?
             }
@@ -1136,8 +1762,10 @@ where
     ///
     /// Mirrors the priming-chunk loop the IM client walks during subscribe
     /// establishment: for each chunk we ack with `StatusResponse(Success)` and
-    /// fetch the next until `more_chunks` clears. The terminal MRP ack is left to
-    /// the caller's `exchange.acknowledge()` (idempotent after our `send_status`).
+    /// fetch the next until `more_chunks` clears. The consuming report driver
+    /// performs the terminal local MRP acknowledgement before it can issue a
+    /// completion proof. This proves only local protocol completion, never that
+    /// the peer accepted an acknowledgement or application state.
     async fn handle_report_data(&self, exchange: &mut Exchange<'_>) -> Result<(), Error> {
         // The peer identity is a property of the (secure) session, constant
         // across every chunk of this report.
@@ -1151,71 +1779,14 @@ where
             )
         })?;
 
-        loop {
-            let (result, more_chunks, suppress_response) = {
-                let rx = exchange.rx()?;
-                let report = ReportDataResp::from_tlv(&TLVElement::new(rx.payload()))?;
-
-                let subscription = crate::dm::SubscriptionCtx {
-                    fabric_idx,
-                    peer_node_id,
-                    subscription_id: report.subscription_id,
-                };
-
-                // The report context is a `HandlerContext` (matter/crypto/kv/…)
-                // over a shared borrow of the exchange, valid only for the
-                // duration of this handler call — after which we resume the
-                // mutable ack/fetch loop below.
-                let ctx = crate::dm::ReportContextInstance::new(&*exchange, self, subscription);
-
-                let case_report = CaseReport {
-                    response: &report,
-                    local_slot: fabric_idx,
-                    node: peer_node_id,
-                    origin: self.matter as *const Matter<'_> as usize,
-                };
-                let result = self
-                    .report_handler
-                    .handle_case_report(ctx, case_report)
-                    .await;
-
-                (
-                    result,
-                    report.more_chunks.unwrap_or(false),
-                    report.suppress_response.unwrap_or(false),
-                )
-            };
-
-            // Spec forbids `suppress_response=true` alongside `more_chunks=true`.
-            if more_chunks && suppress_response {
-                return Self::send_status(exchange, IMStatusCode::InvalidAction).await;
-            }
-
-            // A non-Success handler result disowns the (sub)report; report the
-            // status and stop — no point ack-ing further chunks of a report we
-            // rejected.
-            //
-            // `SuppressResponse` only suppresses the *Success* StatusResponse: a
-            // failure status MUST always be sent (Matter Core spec), so the
-            // publisher can tear down a subscription we no longer track (e.g. our
-            // `InvalidSubscription`). Sending it regardless of `suppress_response`.
-            if let Err(status) = result {
-                return Self::send_status(exchange, status).await;
-            }
-
-            if !suppress_response {
-                Self::send_status(exchange, IMStatusCode::Success).await?;
-            }
-
-            if !more_chunks {
-                break;
-            }
-
-            // Next chunk rides in on the same exchange.
-            exchange.recv_fetch().await?;
-        }
-
-        Ok(())
+        self.report_handler
+            .handle_report_exchange(InboundReportExchange {
+                exchange,
+                model: self,
+                fabric_idx,
+                peer_node_id,
+            })
+            .await
     }
 
     /// Validates the subscription request

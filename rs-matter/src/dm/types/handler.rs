@@ -1916,7 +1916,141 @@ mod asynch {
         ) -> impl Future<Output = Result<(), IMStatusCode>> {
             self.handle_report(ctx, report.response())
         }
+
+        /// Consume one complete inbound report exchange.
+        ///
+        /// The Interaction Model is the only issuer of `exchange`: it borrows
+        /// the actual authenticated inbound exchange and can be consumed only
+        /// once. The default keeps the historical per-chunk callbacks while
+        /// allowing controllers to override this hook and keep bounded staging
+        /// state inside one future until a terminal witness is returned.
+        fn handle_report_exchange(
+            &self,
+            exchange: impl ReportDataExchange,
+        ) -> impl Future<Output = Result<(), Error>> {
+            async move {
+                let _ = exchange.consume(self).await?;
+                Ok(())
+            }
+        }
     }
+
+    mod report_exchange_private {
+        pub trait Sealed {}
+    }
+
+    /// A non-cloneable driver for one authenticated inbound report exchange.
+    ///
+    /// Implementations are sealed and issued only by the Interaction Model.
+    /// Consuming the driver either returns a terminal local-success witness,
+    /// reports application rejection without a witness, or returns a transport
+    /// or decoding error. Local success does not prove remote application receipt.
+    /// A consuming driver cannot be reused or cloned by a consumer:
+    ///
+    /// ```compile_fail
+    /// use rs_matter::dm::{ReportDataExchange, ReportDataVisitor};
+    /// async fn twice<E: ReportDataExchange, V: ReportDataVisitor>(exchange: E, first: V, second: V) {
+    ///     let _ = exchange.consume(first).await;
+    ///     let _ = exchange.consume(second).await;
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use rs_matter::dm::ReportDataExchange;
+    /// fn clone_driver<E: ReportDataExchange>(exchange: E) { let _ = exchange.clone(); }
+    /// ```
+    pub trait ReportDataExchange: report_exchange_private::Sealed + Sized {
+        fn consume<V>(
+            self,
+            visitor: V,
+        ) -> impl Future<Output = Result<ReportExchangeOutcome<V>, Error>>
+        where
+            V: ReportDataVisitor;
+    }
+
+    /// Per-chunk visitor used by [`ReportDataExchange::consume`].
+    pub trait ReportDataVisitor {
+        fn handle_case_report(
+            &mut self,
+            ctx: impl ReportContext,
+            report: crate::im::CaseReport<'_, '_>,
+        ) -> impl Future<Output = Result<(), IMStatusCode>>;
+    }
+
+    impl<T> ReportDataVisitor for &T
+    where
+        T: ReportDataHandler + ?Sized,
+    {
+        fn handle_case_report(
+            &mut self,
+            ctx: impl ReportContext,
+            report: crate::im::CaseReport<'_, '_>,
+        ) -> impl Future<Output = Result<(), IMStatusCode>> {
+            (**self).handle_case_report(ctx, report)
+        }
+    }
+
+    /// Result of consuming an inbound report exchange.
+    pub enum ReportExchangeOutcome<V> {
+        /// Every chunk was accepted and the required local terminal response
+        /// path completed (or was legally suppressed).
+        Complete(ReportExchangeComplete<V>),
+        /// The visitor rejected a chunk and the failure status was sent.
+        Rejected,
+    }
+
+    /// Visitor state paired with an unforgeable terminal local-success witness.
+    ///
+    /// ```compile_fail
+    /// use rs_matter::dm::ReportExchangeTerminal;
+    /// let terminal = ReportExchangeTerminal { _private: () };
+    /// ```
+    /// ```compile_fail
+    /// use rs_matter::dm::{ReportExchangeComplete, ReportExchangeTerminal};
+    /// fn forge(terminal: ReportExchangeTerminal) {
+    ///     let _ = ReportExchangeComplete { visitor: (), terminal };
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use rs_matter::dm::ReportExchangeComplete;
+    /// fn reuse(complete: ReportExchangeComplete<()>) {
+    ///     let _ = complete.into_parts();
+    ///     let _ = complete.into_parts();
+    /// }
+    /// ```
+    pub struct ReportExchangeComplete<V> {
+        visitor: V,
+        terminal: ReportExchangeTerminal,
+    }
+
+    impl<V> ReportExchangeComplete<V> {
+        pub(crate) fn new(visitor: V) -> Self {
+            Self {
+                visitor,
+                terminal: ReportExchangeTerminal { _private: () },
+            }
+        }
+
+        /// Consume completion into the staged visitor and terminal witness.
+        pub fn into_parts(self) -> (V, ReportExchangeTerminal) {
+            (self.visitor, self.terminal)
+        }
+    }
+
+    /// Proof that the local report-exchange protocol path completed.
+    ///
+    /// This type is intentionally neither `Clone` nor publicly constructible.
+    ///
+    /// ```compile_fail
+    /// use rs_matter::dm::ReportExchangeTerminal;
+    /// fn clone_witness(terminal: ReportExchangeTerminal) { let _ = terminal.clone(); }
+    /// ```
+    pub struct ReportExchangeTerminal {
+        _private: (),
+    }
+
+    pub(crate) use report_exchange_private::Sealed as SealedReportDataExchange;
 
     impl<T> ReportDataHandler for &T
     where
@@ -1936,6 +2070,13 @@ mod asynch {
             report: crate::im::CaseReport<'_, '_>,
         ) -> impl Future<Output = Result<(), IMStatusCode>> {
             (**self).handle_case_report(ctx, report)
+        }
+
+        fn handle_report_exchange(
+            &self,
+            exchange: impl ReportDataExchange,
+        ) -> impl Future<Output = Result<(), Error>> {
+            (**self).handle_report_exchange(exchange)
         }
     }
 
@@ -1957,6 +2098,13 @@ mod asynch {
             report: crate::im::CaseReport<'_, '_>,
         ) -> impl Future<Output = Result<(), IMStatusCode>> {
             (**self).handle_case_report(ctx, report)
+        }
+
+        fn handle_report_exchange(
+            &self,
+            exchange: impl ReportDataExchange,
+        ) -> impl Future<Output = Result<(), Error>> {
+            (**self).handle_report_exchange(exchange)
         }
     }
 
