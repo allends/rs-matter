@@ -24,7 +24,8 @@ use embassy_futures::block_on;
 use embassy_futures::select::select;
 
 use rs_matter::im::client::{ImClient, SubscribeOutcome, TxOutcome};
-use rs_matter::im::{AttrPath, GenericPath};
+use rs_matter::im::{AttrPath, GenericPath, ReportDataResp};
+use rs_matter::tlv::FromTLV;
 use rs_matter::utils::select::Coalesce;
 
 use crate::common::e2e::im::echo_cluster;
@@ -81,7 +82,23 @@ fn test_client_subscribe_sender_non_chunked() {
             let established = loop {
                 chunk_count += 1;
                 {
+                    // Inspect each actual chunk's original RX envelope before advancing it.
+                    let element = chunk.response_element()?;
+                    let raw_response = ReportDataResp::from_tlv(&element)?;
                     let resp = chunk.response()?;
+                    assert_eq!(
+                        element.structure()?.ctx(0)?.u32()?,
+                        resp.subscription_id.unwrap()
+                    );
+                    assert_eq!(raw_response.subscription_id, resp.subscription_id);
+                    assert_eq!(raw_response.attr_reports, resp.attr_reports);
+                    assert_eq!(raw_response.event_reports, resp.event_reports);
+                    assert_eq!(raw_response.more_chunks, resp.more_chunks);
+                    assert_eq!(raw_response.suppress_response, resp.suppress_response);
+                    assert_eq!(
+                        raw_response.interaction_model_revision,
+                        resp.interaction_model_revision
+                    );
                     if let Some(attr_reports) = &resp.attr_reports {
                         for attr_resp in attr_reports.iter() {
                             if attr_resp.is_ok() {
@@ -160,7 +177,23 @@ fn test_client_subscribe_sender_chunked_wildcard() {
             let established = loop {
                 chunk_count += 1;
                 {
+                    // Inspect each actual chunk's original RX envelope before advancing it.
+                    let element = chunk.response_element()?;
+                    let raw_response = ReportDataResp::from_tlv(&element)?;
                     let resp = chunk.response()?;
+                    assert_eq!(
+                        element.structure()?.ctx(0)?.u32()?,
+                        resp.subscription_id.unwrap()
+                    );
+                    assert_eq!(raw_response.subscription_id, resp.subscription_id);
+                    assert_eq!(raw_response.attr_reports, resp.attr_reports);
+                    assert_eq!(raw_response.event_reports, resp.event_reports);
+                    assert_eq!(raw_response.more_chunks, resp.more_chunks);
+                    assert_eq!(raw_response.suppress_response, resp.suppress_response);
+                    assert_eq!(
+                        raw_response.interaction_model_revision,
+                        resp.interaction_model_revision
+                    );
                     if let Some(attr_reports) = &resp.attr_reports {
                         for attr_resp in attr_reports.iter() {
                             if attr_resp.is_ok() {

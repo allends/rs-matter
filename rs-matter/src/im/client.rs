@@ -1225,9 +1225,32 @@ impl<'a> SubscribePrimingChunk<'a> {
     /// priming chunk. The returned value points into the exchange's
     /// RX buffer; its lifetime is the borrow of this chunk.
     pub fn response(&self) -> Result<ReportDataResp<'_>, Error> {
+        ReportDataResp::from_tlv(&self.response_element()?)
+    }
+
+    /// Borrow the original `ReportData` RX envelope for structural inspection,
+    /// including duplicate tags that typed decoding may normalize.
+    ///
+    /// The element borrows this chunk, not the exchange's ambient lifetime. It
+    /// cannot outlive the chunk or remain in use while `complete()` consumes it
+    /// and advances RX. This accessor confers no authentication or establishment
+    /// authority; terminal establishment still requires the actual `complete()`
+    /// outcome.
+    ///
+    /// ```compile_fail,E0505
+    /// use rs_matter::error::Error;
+    /// use rs_matter::im::client::SubscribePrimingChunk;
+    ///
+    /// async fn cannot_advance_while_borrowed(chunk: SubscribePrimingChunk<'_>) -> Result<(), Error> {
+    ///     let element = chunk.response_element()?;
+    ///     chunk.complete().await?;
+    ///     let _ = element.structure()?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn response_element(&self) -> Result<TLVElement<'_>, Error> {
         let rx = self.exchange.rx()?;
-        let element = TLVElement::new(rx.payload());
-        ReportDataResp::from_tlv(&element)
+        Ok(TLVElement::new(rx.payload()))
     }
 
     /// ACK the current priming chunk and advance to the next stage:
